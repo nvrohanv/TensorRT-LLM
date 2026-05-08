@@ -108,8 +108,16 @@ bool FmhaDispatcher::isSupported()
         // attributes for kernel selection.
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mQkvLayout = qkvLayout;
         tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
+        {
+            tllmRunnerParams.mLeftSlidingWindow = 0;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
@@ -129,10 +137,6 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
-        // the kernel is supported.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
-        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
         // Sparse context attention uses a generation-style kernel with per-token sparse indices.
         if (mFixedParams.useTllmGenSparseAttention)
         {
@@ -189,6 +193,9 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
@@ -231,8 +238,29 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mMaxSeqLenCacheKv = runnerParams.slidingWindowSize;
         tllmRunnerParams.mMaxSeqLenQ = runnerParams.qSeqLen;
         tllmRunnerParams.mMaxSeqLenKv = runnerParams.kvSeqLen;
-        tllmRunnerParams.mAttentionWindowSize = runnerParams.slidingWindowSize;
         tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
+        bool const usesChunkedAttention = runnerParams.chunkedAttentionSize != INT_MAX
+            && runnerParams.kvSeqLen > runnerParams.chunkedAttentionSize;
+        bool const usesSlidingWindow = runnerParams.slidingWindowSize > 0
+            && runnerParams.kvSeqLen > runnerParams.slidingWindowSize;
+        TLLM_CHECK_WITH_INFO(!(usesChunkedAttention && usesSlidingWindow),
+            "Chunked attention size and sliding window size should not be used together.");
+        if (usesChunkedAttention)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::ChunkedCausal;
+        }
+        else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
+            tllmRunnerParams.mLeftSlidingWindow = runnerParams.slidingWindowSize / 2;
+            tllmRunnerParams.mRightSlidingWindow = runnerParams.slidingWindowSize / 2;
+        }
+        else if (usesSlidingWindow)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
+            tllmRunnerParams.mLeftSlidingWindow = runnerParams.slidingWindowSize - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
