@@ -245,6 +245,9 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        // Derive sliding-window shape booleans (mHasLeftSlidingBound / mHasRightSlidingBound /
+        // mIsChunkedCausal) from the runtime (L, R) pair before the cubin cache lookup hashes them.
+        fmha::normalizeFmhaOptions(options);
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
@@ -299,6 +302,9 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        // Derive sliding-window shape booleans (mHasLeftSlidingBound / mHasRightSlidingBound /
+        // mIsChunkedCausal) from the runtime (L, R) pair before the cubin cache lookup hashes them.
+        fmha::normalizeFmhaOptions(options);
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
@@ -374,9 +380,10 @@ public:
                 fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, /*slidingWindowKvPoolBasePtr=*/nullptr,
                 fmhaData.mMetaData.kvPageIdxD, fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D,
                 fmhaData.mScales.kvSfScaleD, fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
-                fmhaData.mInputBuffers.customMaskOffsetsPtrD, /*sparseMlaTopKLensPtrD=*/nullptr,
+                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                /*sparseMlaTopKLensPtrD=*/nullptr,
                 /*variableWindowTokenStartsD=*/nullptr,
-                /*variableWindowTokenEndsD=*/nullptr, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                /*variableWindowTokenEndsD=*/nullptr,
                 fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
                 fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
                 fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
@@ -664,6 +671,10 @@ private:
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
+        // New trtllm-gen MetaData pointers; not surfaced by TRT-LLM yet.
+        fmhaData.mMetaData.sparseMlaTopKLensPtrD = nullptr;
+        fmhaData.mMetaData.variableWindowTokenStartsD = nullptr;
+        fmhaData.mMetaData.variableWindowTokenEndsD = nullptr;
 
         // Fill Scales
         fmhaData.mScales.kSfBasePtr = params.kvSfPtr;
@@ -695,6 +706,7 @@ private:
         fmhaData.mInputBuffers.attentionSinksPtrD = params.attentionSinksPtr;
         fmhaData.mInputBuffers.customMaskPtrD = params.customMaskPtr;
         fmhaData.mInputBuffers.customMaskOffsetsPtrD = params.customMaskOffsetsPtr;
+        fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr = nullptr;
 
         // Fill OutputBuffers
         fmhaData.mOutputBuffers.oPtrD = params.oPtr;
@@ -779,16 +791,10 @@ private:
 
         // Attention features
         options.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
-        if (params.mAttentionWindowSize > 0)
-        {
-            options.mLeftSlidingWindow = params.mAttentionWindowSize - 1;
-            options.mRightSlidingWindow = 0;
-        }
-        else
-        {
-            options.mLeftSlidingWindow = -1;
-            options.mRightSlidingWindow = -1;
-        }
+        // Sliding-window bounds. params already speaks FA4 (L, R) semantics (-1 = unbounded);
+        // normalizeFmhaOptions later derives the cubin shape booleans from these.
+        options.mLeftSlidingWindow = params.mLeftSlidingWindow;
+        options.mRightSlidingWindow = params.mRightSlidingWindow;
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
         // Sparse attention (MLA / MQA / GQA)
