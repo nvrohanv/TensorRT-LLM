@@ -31,6 +31,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -104,9 +106,40 @@ struct KernelParams {
   int32_t* ptrSkipSoftmaxStats;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ]
+  //  where each tokenQ has a corresponding topK length.
+  int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Left sliding window: query at position q attends to keys in
+  // [max(0, q - mLeftSlidingWindow), ...]. -1 = unbounded left; 0 = left edge at q (only the
+  // current token and beyond are kept on the left side). Pure runtime param - the cubin cache
+  // key uses the SHAPE booleans (mHasLeftSlidingBound etc. on KernelConfigBase), not the value,
+  // so cubins are shared across all (L, R) values of the same shape (same convention as
+  // mChunkedAttentionSize).
+  int32_t mLeftSlidingWindow{-1};
+  // Right sliding window: query at position q attends to keys in
+  // [..., min(seqLenKv - 1, q + mRightSlidingWindow)]. Plain SlidingWindow R == -1 is clamped
+  // to mMaxSeqLenKv - 1 on the host by normalizeFmhaOptions in FmhaOptions.h. R == 0 is pure
+  // causal (right edge at q). Pure runtime param;
+  // see mLeftSlidingWindow for the cache-key story.
+  int32_t mRightSlidingWindow{-1};
+  // Flavor selector for the merged ChunkedCausal/SlidingWindow cubin. True when the user
+  // requested ChunkedCausal (the host folds mMaskType to SlidingWindow so both flavors share
+  // the same cubin cache slot). The codegen's runtime branch on this flag picks the chunked
+  // predicate (using mChunkedAttentionSizeLog2) over the sliding predicate (using
+  // mLeftSlidingWindow). Pure runtime param.
+  bool mIsChunkedCausal{false};
+  // Symm-vs-asymm flavor selector for the merged Bidi (SymmetricBidi + AsymmetricBidi)
+  // SlidingWindow cubin. True when L >= 0 && R > 0 && L == R. Consumed only by LoadSchedule's
+  // runtime-gated workIdThrottleBarrier emit (symmetric bidi unlocks at first iter for early
+  // pipelining; asymmetric/causal-sliding unlocks at last iter). Pure runtime param; mirrors
+  // mIsChunkedCausal.
+  bool mIsSymmetricBidi{false};
+  // VariableWindow bounds, shape [sumSeqLensQ]. Index with cumSeqLensQ[b] + local q.
+  // Values are inclusive K positions local to batch b:
+  // 0 <= start <= qPosK <= end < seqLenKv[b], where qPosK = seqLenKv[b] - seqLenQ[b] + local q.
+  int32_t const* ptrVariableWindowTokenStarts{nullptr};
+  int32_t const* ptrVariableWindowTokenEnds{nullptr};
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
