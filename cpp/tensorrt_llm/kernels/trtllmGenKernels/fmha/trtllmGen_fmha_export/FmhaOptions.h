@@ -22,6 +22,8 @@
 #include <nlohmann/json.hpp>
 #include <cfloat>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace fmha {
 
@@ -35,8 +37,30 @@ namespace fmha {
 struct FmhaOptions : public KernelConfigBase {
   // Relative error tolerance.
   float mAtol{1e-2f};
-  // Attention windows size of sliding window attention. Disabled by default.
-  int mAttentionWindowSize{0};
+  // Sliding-window bounds (FA4 convention; counts EXCLUDE the current token). -1 = unbounded;
+  // 0 = edge at q. Live on FmhaOptions / KernelParams as runtime params (NOT in the cubin
+  // cache key) so two (L, R) pairs with the same shape share a cubin - the SHAPE is captured
+  // by mHasLeftSlidingBound / mHasRightSlidingBound (inherited from KernelConfigBase), set by
+  // normalizeFmhaOptions.
+  int32_t mLeftSlidingWindow{-1};
+  int32_t mRightSlidingWindow{-1};
+  // Flavor selector for the merged ChunkedCausal/SlidingWindow cubin. Set by normalizeFmhaOptions
+  // when the user requested ChunkedCausal: the host folds mMaskType to SlidingWindow (so chunked
+  // and sliding hit the same cubin cache slot) and sets mIsChunkedCausal=true so the codegen's
+  // runtime branch picks the chunked predicate (which uses ChunkedAttentionSizeLog2) instead of
+  // the sliding predicate (which uses LeftSlidingWindow). NOT in the cubin cache key.
+  bool mIsChunkedCausal{false};
+  // Symmetric-vs-asymmetric flavor selector for the merged Bidi (SymmetricBidi + AsymmetricBidi)
+  // SlidingWindow cubin. Set by normalizeFmhaOptions when L >= 0 && R > 0 && L == R; consumed
+  // by LoadSchedule's runtime-gated workIdThrottleBarrier emit (symmetric bidi unlocks at first
+  // iter, asymmetric/causal-sliding unlock at last iter). NOT in the cubin cache key - the merged
+  // Bidi cubin handles both runtime flavors via getParam("IsSymmetricBidi"). Mirrors the
+  // mIsChunkedCausal pattern.
+  bool mIsSymmetricBidi{false};
+  // Per-Q inclusive local K-space bounds in packed-Q order. Length = mSumOfSeqLensQ when populated
+  // by the CLI path. The device consumes the corresponding FmhaData::MetaData pointers.
+  std::vector<int32_t> mVariableWindowTokenStarts{};
+  std::vector<int32_t> mVariableWindowTokenEnds{};
   // Batch size.
   int mBatchSize{2};
   // Whether to verify the correctness. 0: No check, 1: partial, 2: full.
@@ -72,6 +96,8 @@ struct FmhaOptions : public KernelConfigBase {
   int mMinSeqLenQ{INT_MAX};
   // The minimum sequence length (used to generate variable Kv sequence length).
   int mMinSeqLenKv{INT_MAX};
+  // The minimum sparse MLA topK length.
+  int mMinSparseMlaTopK{1};
   // Benchmark steps.
   int mNumBenchmarkSteps{1};
   // The number of Ctas per sequenceKv from the arguments.
@@ -115,10 +141,13 @@ struct FmhaOptions : public KernelConfigBase {
 
     // Then, serialize the FmhaOptions-specific members.
     TO_JSON(mAtol);
-    TO_JSON(mAttentionWindowSize);
     TO_JSON(mBatchSize);
     TO_JSON(mChecksResults);
     TO_JSON(mChunkedAttentionSize);
+    TO_JSON(mIsChunkedCausal);
+    TO_JSON(mIsSymmetricBidi);
+    TO_JSON(mLeftSlidingWindow);
+    TO_JSON(mRightSlidingWindow);
     TO_JSON(mDryRun);
     TO_JSON(mEnablesAutoTuner);
     TO_JSON(mIsExportingCubin);
@@ -132,6 +161,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mMinFirstSparseMaskOffsetKv);
     TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSeqLenKv);
+    TO_JSON(mMinSparseMlaTopK);
     TO_JSON(mNumBenchmarkSteps);
     TO_JSON(mNumCtasPerSeqKv);
     TO_JSON(mNumLoopItersForPrint);
@@ -219,9 +249,140 @@ struct FmhaConfig {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Check if the options are valid or not.
+// Rewrite user-facing mask options into the form used by autotuning, the cubin cache key, and
+// codegen. checkFmhaOptions runs after this and only validates.
+inline void normalizeFmhaOptions(FmhaOptions& options) {
+  // If ChunkedCausal was already folded to SlidingWindow, do not process it again.
+  if (options.mIsChunkedCausal) {
+    return;
+  }
+
+  // Infer the mask type from options that imply a non-dense mask.
+  bool const newSidesSet =
+    options.mLeftSlidingWindow != -1 || options.mRightSlidingWindow != -1;
+  if (options.mChunkedAttentionSize > 0 &&
+      (options.mMaskType == AttentionMaskType::Dense ||
+       options.mMaskType == AttentionMaskType::SlidingWindow)) {
+    TLLM_CHECK_ERROR(!newSidesSet,
+                     "chunkedAttentionSize cannot be combined with leftSlidingWindow / "
+                     "rightSlidingWindow; use ChunkedCausal mask alone.");
+    options.mMaskType = AttentionMaskType::ChunkedCausal;
+  } else if (newSidesSet && options.mMaskType == AttentionMaskType::Dense) {
+    options.mMaskType = AttentionMaskType::SlidingWindow;
+  }
+
+  // Use the SlidingWindow cubin for ChunkedCausal. The runtime flag below tells the generated
+  // kernel to use chunk boundaries instead of q - L for the left edge.
+  if (options.mMaskType == AttentionMaskType::ChunkedCausal) {
+    options.mIsChunkedCausal = true;
+    options.mMaskType = AttentionMaskType::SlidingWindow;
+    options.mLeftSlidingWindow = options.mChunkedAttentionSize - 1;
+    options.mRightSlidingWindow = 0;
+  }
+
+  // SlidingWindow with both sides unbounded is dense.
+  if (isSlidingWindowMask(options.mMaskType) &&
+      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == -1) {
+    options.mMaskType = AttentionMaskType::Dense;
+  }
+
+  // Warn when either side individually exceeds mMaxSeqLenKv. This usually means a config typo.
+  if (isSlidingWindowMask(options.mMaskType)) {
+    if (options.mLeftSlidingWindow > options.mMaxSeqLenKv) {
+      TLLM_LOG_WARNING(
+        "leftSlidingWindow (", options.mLeftSlidingWindow,
+        ") exceeds mMaxSeqLenKv (", options.mMaxSeqLenKv,
+        "); the kernel clamps the per-row reach but this likely indicates a config error.");
+    }
+    if (options.mRightSlidingWindow > options.mMaxSeqLenKv) {
+      TLLM_LOG_WARNING(
+        "rightSlidingWindow (", options.mRightSlidingWindow,
+        ") exceeds mMaxSeqLenKv (", options.mMaxSeqLenKv,
+        "); the kernel clamps the per-row reach but this likely indicates a config error.");
+    }
+  }
+
+  // A fully-bounded SlidingWindow that covers the whole sequence is better written as Causal or
+  // Dense. VariableWindow is excluded because its per-token bounds can still narrow the range.
+  if (isSlidingWindowMask(options.mMaskType)) {
+    int64_t const effectiveWindow =
+      static_cast<int64_t>(std::max(0, options.mLeftSlidingWindow)) +
+      static_cast<int64_t>(std::max(0, options.mRightSlidingWindow)) + 1;
+    bool const eitherSideUnbounded =
+      options.mLeftSlidingWindow == -1 || options.mRightSlidingWindow == -1;
+    if (!eitherSideUnbounded && effectiveWindow >= options.mMaxSeqLenKv) {
+      char const* degenerate = (options.mRightSlidingWindow == 0) ? "Causal" : "Dense";
+      char const* canonical = (options.mRightSlidingWindow == 0) ? "causal" : "dense";
+      TLLM_LOG_WARNING(
+        "SlidingWindow window (L + R + 1 = ", effectiveWindow,
+        ") covers the full mMaxSeqLenKv (", options.mMaxSeqLenKv,
+        "); this degenerates to ", degenerate, " - prefer -maskType ", canonical,
+        " for clarity.");
+    }
+  }
+
+  // Plain SlidingWindow uses a finite right bound on device. R == -1 means "unbounded", so use
+  // mMaxSeqLenKv - 1 as a large enough value.
+  if (isSlidingWindowMask(options.mMaskType) && options.mRightSlidingWindow == -1) {
+    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType),
+                     "rightSlidingWindow == -1 (unbounded right) is only supported for context "
+                     "(prefill) kernels. Use rightSlidingWindow = 0 (causal) or pick a positive R.");
+    TLLM_CHECK_ERROR(options.mMaxSeqLenKv > 0,
+                     "rightSlidingWindow == -1 requires a positive mMaxSeqLenKv to clamp to.");
+    options.mRightSlidingWindow = options.mMaxSeqLenKv - 1;
+  }
+
+  // SlidingWindow with unbounded left and R == 0 is just causal.
+  if (isSlidingWindowMask(options.mMaskType) &&
+      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == 0) {
+    options.mMaskType = AttentionMaskType::Causal;
+  }
+
+  // These booleans describe the cubin shape. SlidingWindow gets them from L/R. VariableWindow
+  // always has per-row left and right bounds in its metadata arrays.
+  if (isAnySlidingWindowMask(options.mMaskType)) {
+    options.mHasLeftSlidingBound =
+      isVariableWindowMask(options.mMaskType) || (options.mLeftSlidingWindow >= 0);
+    options.mHasRightSlidingBound =
+      isVariableWindowMask(options.mMaskType) || (options.mRightSlidingWindow > 0);
+    options.mIsSymmetricBidi = options.mHasLeftSlidingBound && options.mHasRightSlidingBound &&
+                               !isVariableWindowMask(options.mMaskType) &&
+                               (options.mLeftSlidingWindow == options.mRightSlidingWindow);
+  }
+}
+
+// Validate FmhaOptions. Call after normalizeFmhaOptions and the autotuner. Pure validation -
+// does not mutate options.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
+
+  // R > 0 makes per-CTA work nondeterministic on the K side, which generation-phase kernels
+  // (1 token Q per CTA) cannot model correctly. The R == -1 unbounded case on a non-context
+  // kernel is caught earlier in normalizeFmhaOptions with a more specific message.
+  TLLM_CHECK_ERROR(!(options.mRightSlidingWindow > 0 &&
+                     !isContextKernel(options.mFmhaKernelType)),
+                   "rightSlidingWindow > 0 is only supported for context (prefill) kernels. "
+                   "Generation-phase kernels are 1-token-per-CTA on Q and have no use for a "
+                   "right-side window.");
+
+  // Plain SlidingWindow needs at least one bounded side. VariableWindow gets its bounds from
+  // per-token metadata arrays.
+  if (isSlidingWindowMask(options.mMaskType)) {
+    TLLM_CHECK_ERROR(options.mLeftSlidingWindow >= 0 ||
+                       options.mRightSlidingWindow >= 0,
+                     "SlidingWindow requires at least one bounded side. "
+                     "Use -maskType dense if both sides are meant to be unbounded.");
+  }
+
+  // VariableWindow extra constraints.
+  if (isVariableWindowMask(options.mMaskType)) {
+    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType),
+                     "VariableWindow is only supported with context (prefill) kernels.");
+    TLLM_CHECK_ERROR(!options.mGroupsTokensHeadsQ,
+                     "VariableWindow does not support groupsTokensHeadsQ because "
+                     "mGroupsTokensHeadsQ is only supported by generation kernels.");
+  }
+
 
   TLLM_CHECK_ERROR(!(options.mGroupsHeadsQ && isPackedQkv(options.mQkvLayout)),
                    "Grouping Q heads doesn't work with the packedQkv layout");
@@ -349,18 +510,29 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                    "PackedQkv layout does not support supportsDiffSeqLensForQAndKv");
   // Q does not support E2m1 dtype.
   TLLM_CHECK_ERROR(options.mDtypeQ != tg::Dtype::E2m1, "Q does not suppot E2m1 dtype");
-  // Make sure correct attention window size is set.
-  TLLM_CHECK_ERROR(!isSlidingOrChunkedCausalMask(options.mMaskType) ||
-                     options.mAttentionWindowSize > 0 || options.mChunkedAttentionSize > 0,
-                   "Please set correct sliding attention window size or chunked attention size");
   if (options.mChunkedAttentionSize > 0) {
-    TLLM_CHECK_ERROR(options.mAttentionWindowSize >= options.mMaxSeqLenKv,
-                     "sliding attention window size must be greater than or equal to maxSeqLenKv");
+    // After normalizeFmhaOptions, ChunkedCausal has been folded to SlidingWindow with
+    // mIsChunkedCausal = true, so check the runtime flavor flag instead of the (now-erased)
+    // ChunkedCausal mask type.
+    TLLM_CHECK_ERROR(options.mIsChunkedCausal,
+                     "chunkedAttentionSize > 0 requires -maskType chunkedCausal");
     TLLM_CHECK_ERROR(options.mChunkedAttentionSize % (options.mTileSizeKv * options.mNumInstsKv) ==
                        0,
                      "Chunked attention size must be a multiple of the tileSizePerCtaKv");
     TLLM_CHECK_ERROR((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                      "Chunked attention size must be power of 2");
+  }
+  if (options.mIsChunkedCausal) {
+    TLLM_CHECK_ERROR(options.mChunkedAttentionSize > 0,
+                     "ChunkedCausal mask requires chunkedAttentionSize > 0");
+    // Defense-in-depth: the fold sets these to (C - 1, 0); a direct-from-API caller that bypasses
+    // normalizeFmhaOptions and sets mIsChunkedCausal manually must respect the same shape.
+    TLLM_CHECK_ERROR(options.mMaskType == AttentionMaskType::SlidingWindow,
+                     "mIsChunkedCausal requires mMaskType = SlidingWindow (post-fold).");
+    TLLM_CHECK_ERROR(options.mLeftSlidingWindow == options.mChunkedAttentionSize - 1 &&
+                       options.mRightSlidingWindow == 0,
+                     "mIsChunkedCausal requires (mLeftSlidingWindow, mRightSlidingWindow) = "
+                     "(mChunkedAttentionSize - 1, 0); use normalizeFmhaOptions to derive these.");
   }
 
   // Special options for FP4.
@@ -438,6 +610,13 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(
       options.mSparseAttnTopK % 4 == 0,
       "SparseAttnTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
+  }
+  if (options.mHasSlidingWindowKvPool) {
+    TLLM_CHECK_ERROR(
+      supportsVarSparseMlaTopKLens(options),
+      "The sliding-window KV pool is only supported by dynamic-token sparse MLA kernels.");
+    TLLM_CHECK_ERROR(options.mSingleTokenQPerCta,
+                     "mSingleTokenQPerCta must be true when sliding-window KV pool is enabled.");
   }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.

@@ -242,6 +242,7 @@ public:
         FmhaOptionsFromArgs optionsFromArgs;
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
+        normalizeFmhaOptions(options);
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
@@ -296,6 +297,7 @@ public:
         FmhaOptionsFromArgs optionsFromArgs;
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
+        normalizeFmhaOptions(options);
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
@@ -303,6 +305,13 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+
+        if (isVariableWindowMask(options.mMaskType))
+        {
+            TLLM_CHECK_WITH_INFO(params.variableWindowTokenStartsPtr != nullptr
+                    && params.variableWindowTokenEndsPtr != nullptr,
+                "VariableWindow requires variableWindowTokenStartsPtr and variableWindowTokenEndsPtr.");
+        }
 
         // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
@@ -371,10 +380,12 @@ public:
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
-                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, fmhaData.mMetaData.kvPageIdxD,
+                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
+                fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
                 fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
                 fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
-                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD, nullptr,
+                fmhaData.mMetaData.variableWindowTokenStartsD, fmhaData.mMetaData.variableWindowTokenEndsD,
                 fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
                 fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
                 fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
@@ -662,6 +673,8 @@ private:
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
+        fmhaData.mMetaData.variableWindowTokenStartsD = params.variableWindowTokenStartsPtr;
+        fmhaData.mMetaData.variableWindowTokenEndsD = params.variableWindowTokenEndsPtr;
 
         // Fill Scales
         fmhaData.mScales.kSfBasePtr = params.kvSfPtr;
@@ -690,6 +703,7 @@ private:
         fmhaData.mInputBuffers.qBasePtr = qPtr;
         fmhaData.mInputBuffers.kBasePtr = kPtr;
         fmhaData.mInputBuffers.vBasePtr = vPtr;
+        fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr = nullptr;
         fmhaData.mInputBuffers.attentionSinksPtrD = params.attentionSinksPtr;
         fmhaData.mInputBuffers.customMaskPtrD = params.customMaskPtr;
         fmhaData.mInputBuffers.customMaskOffsetsPtrD = params.customMaskOffsetsPtr;
@@ -767,6 +781,13 @@ private:
         // Layout and mask configuration
         options.mQkvLayout = params.mQkvLayout;
         options.mMaskType = params.mMaskType;
+        if (params.variableWindowTokenStartsPtr != nullptr || params.variableWindowTokenEndsPtr != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(params.variableWindowTokenStartsPtr != nullptr
+                    && params.variableWindowTokenEndsPtr != nullptr,
+                "VariableWindow requires both variableWindowTokenStartsPtr and variableWindowTokenEndsPtr.");
+            options.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
+        }
         options.mFmhaKernelType = params.mKernelType;
         options.mTileScheduler = params.mTileScheduler;
 
@@ -777,8 +798,9 @@ private:
 
         // Attention features
         options.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
-        options.mAttentionWindowSize = params.mAttentionWindowSize;
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
+        options.mLeftSlidingWindow = params.mLeftSlidingWindow;
+        options.mRightSlidingWindow = params.mRightSlidingWindow;
 
         // Sparse attention (MLA / MQA / GQA)
         options.mSparseType = params.mSparseAttention;

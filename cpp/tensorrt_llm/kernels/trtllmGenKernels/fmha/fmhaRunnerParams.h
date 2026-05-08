@@ -34,11 +34,15 @@ enum class TrtllmGenAttentionMaskType
     // Dense mask.
     Dense = 0,
     // Causal mask.
-    Causal,
-    // Sliding window or chunked causal mask.
-    SlidingOrChunkedCausal,
+    Causal = 1,
+    // Sliding window mask, parameterized by left/right bounds.
+    SlidingWindow = 2,
     // Custom mask.
-    Custom
+    Custom = 3,
+    // Chunked causal mask. normalizeFmhaOptions folds this to SlidingWindow with a runtime flag.
+    ChunkedCausal = 4,
+    // Per-token contiguous window bounds.
+    VariableWindow = 5
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -53,10 +57,22 @@ enum class TrtllmGenAttentionMaskType
 
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindow)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(ChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+inline bool isAnySlidingWindowMask(TrtllmGenAttentionMaskType maskType)
+{
+    return isSlidingWindowMask(maskType) || isVariableWindowMask(maskType);
+}
+
+inline bool isSlidingOrChunkedCausalMask(TrtllmGenAttentionMaskType maskType)
+{
+    return isAnySlidingWindowMask(maskType) || isChunkedCausalMask(maskType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -277,6 +293,9 @@ struct TllmGenFmhaRunnerParams
     float const* sageAttnSfsVPtr = nullptr;
     // The sequence lengths for Q.
     int const* seqLensQPtr;
+    // VariableWindow bounds, shape [sumSeqLensQ], indexed by packed Q row.
+    int32_t const* variableWindowTokenStartsPtr;
+    int32_t const* variableWindowTokenEndsPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -294,9 +313,9 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
-    // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
-    // mAttentionWindowSize).
-    int mAttentionWindowSize;
+    // Explicit sliding-window bounds. A negative value means unbounded on that side.
+    int mLeftSlidingWindow;
+    int mRightSlidingWindow;
     // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
     int mChunkedAttentionSize;
     // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
@@ -341,20 +360,42 @@ struct TllmGenFmhaRunnerParams
         {
         case 0: // tensorrt_llm::kernels::ContextAttentionMaskType::PADDING
             mMaskType = TrtllmGenAttentionMaskType::Dense;
+            mLeftSlidingWindow = -1;
+            mRightSlidingWindow = -1;
             break;
         case 1: // tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL
             mMaskType = TrtllmGenAttentionMaskType::Causal;
+            mLeftSlidingWindow = -1;
+            mRightSlidingWindow = -1;
             break;
         case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
-            mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+            mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
+            mLeftSlidingWindow = 0;
+            mRightSlidingWindow = 0;
             break;
-        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+        case 4: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
+            mLeftSlidingWindow = -1;
+            mRightSlidingWindow = -1;
             break;
         default:
             TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
                 static_cast<int>(maskType));
         }
+        return *this;
+    }
+
+    // Configure trtllm-gen VariableWindow directly. The bounds arrays have shape [sumSeqLensQ]
+    // and are indexed by packed Q row; each row stores inclusive local K bounds [start, end].
+    TllmGenFmhaRunnerParams& setVariableWindowMask(int32_t const* tokenStarts, int32_t const* tokenEnds)
+    {
+        TLLM_CHECK_WITH_INFO(
+            tokenStarts != nullptr && tokenEnds != nullptr, "VariableWindow requires start and end bound arrays.");
+        mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
+        variableWindowTokenStartsPtr = tokenStarts;
+        variableWindowTokenEndsPtr = tokenEnds;
+        mLeftSlidingWindow = -1;
+        mRightSlidingWindow = -1;
         return *this;
     }
 };

@@ -115,10 +115,19 @@ enum class AttentionMaskType {
   Dense = 0,
   // Causal mask.
   Causal,
-  // Sliding window causal mask or chunked attention causal mask.
-  SlidingOrChunkedCausal,
+  // Sliding window mask, parameterised by (leftSlidingWindow, rightSlidingWindow). FA4-aligned
+  // semantics: leftSlidingWindow = L and rightSlidingWindow = R define the inclusive K range
+  // [q - L, q + R]. (L = W-1, R = 0) is causal sliding window of W tokens; (L = R) is the
+  // symmetric bidirectional sliding window of (2L + 1) tokens.
+  SlidingWindow,
   // Custom mask.
-  Custom
+  Custom,
+  // Chunked-causal attention. Independent shape from SlidingWindow: queries attend within a
+  // power-of-two chunk of size mChunkedAttentionSize.
+  ChunkedCausal,
+  // Per-token contiguous window. Each packed-Q row reads inclusive local K bounds [start, end],
+  // which must contain that Q row's K-space position: start <= qPosK <= end.
+  VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -132,10 +141,25 @@ enum class AttentionMaskType {
 
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindow)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(ChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+// True for any contiguous-window mask (SlidingWindow OR VariableWindow). Use this
+// in place of isSlidingWindowMask when a code path should fire for both the basic (L, R)-only
+// mask and per-token window bounds (TMA loop bounds, schedules, per-tile mask-skip logic).
+__host__ __device__ inline bool isAnySlidingWindowMask(AttentionMaskType maskType) {
+  return isSlidingWindowMask(maskType) || isVariableWindowMask(maskType);
+}
+
+// Convenience umbrella predicate: true iff the kernel must emit per-row left-bound / chunk-bound
+// masking. SlidingWindow, VariableWindow, and ChunkedCausal all qualify.
+__host__ __device__ inline bool isSlidingOrChunkedCausalMask(AttentionMaskType maskType) {
+  return isAnySlidingWindowMask(maskType) || isChunkedCausalMask(maskType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -383,10 +407,14 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Dense";
   case AttentionMaskType::Causal:
     return "Causal";
-  case AttentionMaskType::SlidingOrChunkedCausal:
-    return "SlidingOrChunkedCausal";
+  case AttentionMaskType::SlidingWindow:
+    return "SlidingWindow";
   case AttentionMaskType::Custom:
     return "Custom";
+  case AttentionMaskType::ChunkedCausal:
+    return "ChunkedCausal";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     TLLM_LOG_ERROR("Unsupported enum.");
     return "";
@@ -517,6 +545,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
   X(bool, mGroupsTokensHeadsQ, false, bool)                                                        \
+  /* Whether the DSv4 sparse MLA sliding-window KV pool is enabled. */                             \
+  X(bool, mHasSlidingWindowKvPool, false, bool)                                                    \
   /* The head dimension per CTA for V. */                                                          \
   X(int32_t, mHeadDimPerCtaV, 0, int32_t)                                                          \
   /* The head dimension per stage for K/V. */                                                      \
@@ -531,6 +561,24 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mInterleaveSfV, false, bool)                                                             \
   /* Attention mask type. */                                                                       \
   X(AttentionMaskType, mMaskType, AttentionMaskType::Dense, int)                                   \
+  /* Sliding-window shape booleans. Derived from (mLeftSlidingWindow, mRightSlidingWindow) by */  \
+  /* normalizeFmhaOptions and used to drive compile-time codegen branches in Mask.h /             */ \
+  /* FmhaTask.h / SmemPageOffsetsKv.h. Encoded as part of the cubin cache key so different      */ \
+  /* sliding-window SHAPES get different cubins, but the actual (L, R) VALUES are NOT in the     */ \
+  /* key - they live on FmhaOptions / KernelParams as runtime params, so any two (L, R) pairs    */ \
+  /* with the same shape (e.g. (L=128, R=0) and (L=512, R=0)) share a cubin (matches main's      */ \
+  /* mAttentionWindowSize behavior, and the existing mChunkedAttentionSize convention).         */ \
+  /* True iff L >= 0 (bounded left). */                                                          \
+  X(bool, mHasLeftSlidingBound, false, bool)                                                       \
+  /* True iff R >  0 (bidirectional or asymmetric right). R == 0 (causal-sliding) and R == -1   */ \
+  /* (which normalizeFmhaOptions clamps before any KernelTraits is built) are both encoded as    */ \
+  /* false here - the codegen routes them through the causal-shortcut path.                    */ \
+  X(bool, mHasRightSlidingBound, false, bool)                                                      \
+  /* (mIsSymmetricBidi was previously a third cache-key shape boolean. It now lives on         */ \
+  /*  FmhaOptions / KernelParams as a runtime param next to mIsChunkedCausal so symmetric and    */ \
+  /*  asymmetric bidirectional plain SlidingWindow share a single cubin shape, with             */ \
+  /*  LoadSchedule's "balanced mask" optimization runtime-gated via getParam("IsSymmetricBidi") */ \
+  /*  - mirrors the IsChunkedCausal fold convention.)                                          */ \
   /* The MMA order (only used when numInstsQ == 2). */                                             \
   X(MmaOrder, mMmaOrder, MmaOrder::Pv0_Qk0_Pv1_Qk1, int)                                           \
   /* The multiCtasKvMode. */                                                                       \
@@ -671,6 +719,13 @@ struct KernelConfigBase {
 
   bool operator!=(KernelConfigBase const& o) const { return !(*this == o); }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Config_>
+__host__ __device__ inline bool supportsVarSparseMlaTopKLens(Config_ const& config) {
+  return config.mIsMlaGen && isDynamicTokenSparse(config.mSparseType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

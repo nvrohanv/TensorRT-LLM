@@ -278,6 +278,9 @@ bool XqaDispatcher::isSupported()
         // Create TllmGenFmhaRunnerParams.
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
         tllmRunnerParams.mMaskType
             = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
@@ -294,10 +297,6 @@ bool XqaDispatcher::isSupported()
         // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
         // ContiguousKv must use 0 so hash matches registered cubins.
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
-        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
-        // the kernel is supported.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
-        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
         // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
         // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
         tllmRunnerParams.mBatchSize = 1;
@@ -408,6 +407,9 @@ void XqaDispatcher::runImpl(
         // Build runner parameters.
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
 
         // Parameters to select kernels.
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
@@ -505,8 +507,6 @@ void XqaDispatcher::runImpl(
             ? params.max_attention_window_size
             : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
-        // The sliding window attention size.
-        tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
         tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
@@ -519,12 +519,24 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
         tllmRunnerParams.mIsSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
-        // Declare SWA layers as SlidingOrChunkedCausal directly so warmup and runtime
+        // Declare SWA layers as SlidingWindow directly so warmup and runtime
         // pick the same kernel bucket (no JIT miss)
         tllmRunnerParams.mMaskType = tllmRunnerParams.mIsSpecDecTree
             ? TrtllmGenAttentionMaskType::Custom
-            : (params.is_sliding_window ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+            : (params.is_sliding_window ? TrtllmGenAttentionMaskType::SlidingWindow
                                         : TrtllmGenAttentionMaskType::Causal);
+        if (params.is_sliding_window)
+        {
+            tllmRunnerParams.mLeftSlidingWindow = params.cyclic_attention_window_size - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
+        if (!tllmRunnerParams.mIsSpecDecTree && params.chunked_attention_size != INT_MAX
+            && params.chunked_attention_size > 0)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::ChunkedCausal;
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;

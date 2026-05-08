@@ -109,13 +109,9 @@ struct KernelConfig : public KernelConfigBase {
     // The maximum headDim for K and V.
     mMaxHeadDimKv = std::max(mHeadDimQk, mHeadDimV);
 
-    // The tileSizeN of the tileB in each CTA, which is computed as tileSizeND / clusterDimX.
-    int32_t tileSizeNB = mTileSizeKv / options.mClusterDimX;
-
-    // Is it the DS MLA-generation kernel with keepsMmaAb?
-    bool keepsMmaAbForDsMlaGen = mIsMlaGen &&
-                                 isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType) &&
-                                 (mHeadDimQk == 576 && mHeadDimV == 512);
+    // Is it the MLA-generation kernel with keepsMmaAb?
+    bool keepsMmaAbForDsMlaGen =
+      mIsMlaGen && isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType);
 
     // Set the number of stages of the Q shared memory buffer.
     // When numTileKv is equal to 2, setting mNumStagesQ to 2 can also improve performance with the
@@ -200,14 +196,20 @@ struct KernelConfig : public KernelConfigBase {
 
       // When the headDim is not split into multiple stages, we can use at most 4 stages for e4m3
       // data type.
+      // Note that dtypeQ is used to calculate the number of stages because it denotes the compute
+      // data type.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
       } else if (keepsMmaAbForDsMlaGen) {
-        // For DS MLA-generation kernels with keepsMmaAb, we can only have at most 8 stages for e4m3
-        // data type.
-        mNumStagesKv = int32_t{(tileSizeNB == 64 ? 14 : 8) * 8 /*bits*/ /
-                               std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+        // For DS MLA-generation kernels with keepsMmaAb, allocate at most 112 KiB shared memory for
+        // 2-CTA mode and 128 KiB shared memory for 1-CTA mode. This preserves the previous stage
+        // counts: 14/7 stages for 2-CTA e4m3/bf16 and 8/4 stages for 1-CTA e4m3/bf16.
+        if (options.mClusterDimX == 2) {
+          mNumStagesKv = calculateNumStagesKv(112, options.mClusterDimX);
+        } else {
+          mNumStagesKv = calculateNumStagesKv(128, options.mClusterDimX);
+        }
       } else if (mReuseSmemKForV) {
         // Only MlaGen kernels support reusing smemK for V. More limitations can be found in
         // checkFmhaOptions.
@@ -220,13 +222,12 @@ struct KernelConfig : public KernelConfigBase {
         // The maximum buffer size for smemKv (at most 144KB for KV, and at most 218KB for Qkv).
         int32_t maxBufferSizeKBForSmemKv = std::min(144, 218 - totalNumKBSmemQ * mNumStagesQ);
         // SwapsMmaAb CGA-reduction kernels allocate the reduction buffer in addition to smemKv.
-        // For DS MLA Q32, the generic 144KB KV budget exceeds the Blackwell 228KB smem cap.
-        if (mSwapsMmaAb && isCgaSmemReduction(mMultiCtasKvMode) && mIsMlaGen && mHeadDimQk == 576 &&
-            mHeadDimV == 512 && mTileSizeQ == 32) {
+        // For MLA Q32, the generic 144KB KV budget exceeds the Blackwell 228KB smem cap.
+        if (mSwapsMmaAb && isCgaSmemReduction(mMultiCtasKvMode) && mIsMlaGen && mTileSizeQ == 32) {
           maxBufferSizeKBForSmemKv = std::min(maxBufferSizeKBForSmemKv, 136);
         }
         // Calculate the number of stages for smemKv.
-        mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv);
+        mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv, options.mClusterDimX);
       }
       mNumStagesTransformedKv = tg::dtypeGetNumBits(mDtypeKv) >= 8 ? 2 : 4;
       mNumStagesTransposedV = 0;
@@ -338,14 +339,14 @@ struct KernelConfig : public KernelConfigBase {
 
 private:
   // Calculate the number of stages for K/V.
-  int32_t calculateNumStagesKv(int32_t bufferSizeKB) {
+  int32_t calculateNumStagesKv(int32_t bufferSizeKB, int32_t clusterDimX) {
     // The total number of bits for K/V.
     int64_t totalNumBitsKv = bufferSizeKB * 1024 * 8;
     // The head dimension per stage for K/V.
     int32_t headDimPerStageKv = mHeadDimPerStageKv == 0 ? mHeadDimQk : getHeadDimPerStageK();
     // The number of bits per tileKv.
     int64_t numBitsPerTileKv =
-      std::max(tg::dtypeGetNumBits(mDtypeQ), 8) * mTileSizeKv * headDimPerStageKv;
+      std::max(tg::dtypeGetNumBits(mDtypeQ), 8) * mTileSizeKv * headDimPerStageKv / clusterDimX;
     // The number of stages.
     return std::max(1, static_cast<int32_t>(totalNumBitsKv / numBitsPerTileKv));
   }
@@ -451,8 +452,13 @@ struct MmaTraits {
     // For DeepSeek MLA, we force the MMA's headDim to be 128 as we distribute the headDim
     // over multiple MMAs.
     mAtomPvM = options.mSwapsMmaAb ? std::min(128, options.mHeadDimV) : options.mTileSizeQ;
-    mAtomPvN = options.mSwapsMmaAb ? options.mTileSizeQ
-                                   : std::min(128 * options.mClusterDimX, options.mHeadDimV);
+    // The headDimPerStageKv.
+    auto headDimPerStageKv =
+      options.mHeadDimPerStageKv != 0 ? options.mHeadDimPerStageKv : options.mHeadDimV;
+    // AtomPvN is limited to 256 (UTCMMA-N).
+    mAtomPvN = options.mSwapsMmaAb
+                 ? options.mTileSizeQ
+                 : std::min({headDimPerStageKv * options.mClusterDimX, options.mHeadDimV, 256});
 
     if (tg::isArchHopper(options.mCudaArch) && (options.mNumInstsQ == 1)) {
       mAtomPvN = std::min(128 * options.mClusterDimX, options.mHeadDimV / 2);
@@ -540,6 +546,12 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
   int32_t mNumLoadTaskWarps;
   // The number of transform stages for SmemTransformedKv.
   int32_t mNumSmemTransformStages;
+  // The scaling factor shared memory tile size.
+  int32_t mNumSfEltsPerSmemStageKv;
+  // The number of valid scaling factor elements loaded by each TMA.
+  int32_t mNumSfEltsPerTmaKv;
+  // The shared-memory spacing reserved for each scaling factor TMA.
+  int32_t mNumSfEltsPerTmaPaddedKv;
   // The number of TMEM columns for each stage of K/V.
   int32_t mNumTmemColsPerStageKv;
   // The number of TMEM columns for P.
@@ -606,6 +618,16 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
                          (mTileSizeEpilogueM == mTileSizeQ && mHeadDimV % mTileSizeEpilogueN == 0),
                        "Not supported");
     }
+
+    // Plain SlidingWindow needs at least one bounded side. If both are false, it should have been
+    // rewritten to Dense before codegen.
+    TLLM_CHECK_ERROR(!isSlidingWindowMask(mMaskType) ||
+                       (mHasLeftSlidingBound || mHasRightSlidingBound),
+                     "SlidingWindow kernels must have at least one of (mHasLeftSlidingBound, "
+                     "mHasRightSlidingBound) set to true. Both being false indicates that a code "
+                     "path bypassed normalizeFmhaOptions, which is responsible for setting these "
+                     "flags from (mLeftSlidingWindow, mRightSlidingWindow). Call "
+                     "normalizeFmhaOptions(options) before constructing FmhaConfig.");
 
     // Make sure the two MMAs consume the same K width in bits.
     int32_t bmm1KBits = mAtomQkK * tg::dtypeGetNumBits(mDtypeBmm1);
@@ -780,8 +802,21 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     if (mDtypeK == tg::Dtype::E2m1 || mDtypeV == tg::Dtype::E2m1) {
       TLLM_CHECK_ERROR(mDtypeK == mDtypeV, "E2m1 requires dtypeK == dtypeV.");
     }
-    // The size of the K/V scaling factor tile per stage.
-    int32_t smemKvSfTileSize = mDtypeKv == tg::Dtype::E2m1 ? tileSizeNB * numSfPerRow : 0;
+    // The size of the K/V scaling factor tile per stage. TMA requires the shared-memory
+    // destination address to be 128B aligned. For small paged-KV SF chunks, reserve padded shared
+    // memory spacing per TMA while keeping the global SF layout and transaction bytes unchanged.
+    int32_t smemKvSfTxSize = 0;
+    mNumSfEltsPerSmemStageKv = 0;
+    mNumSfEltsPerTmaKv = 0;
+    mNumSfEltsPerTmaPaddedKv = 0;
+    if (mDtypeKv == tg::Dtype::E2m1) {
+      int32_t const numKeysPerSfTma = std::min(mNumKeysPerTile, tileSizeNB);
+      int32_t const numSfTmasPerSmemStage = ceilDiv(tileSizeNB, numKeysPerSfTma);
+      mNumSfEltsPerTmaKv = numKeysPerSfTma * numSfPerRow;
+      mNumSfEltsPerTmaPaddedKv = ceilDiv(mNumSfEltsPerTmaKv, 128) * 128;
+      mNumSfEltsPerSmemStageKv = numSfTmasPerSmemStage * mNumSfEltsPerTmaPaddedKv;
+      smemKvSfTxSize = tileSizeNB * numSfPerRow;
+    }
     // Calculate the mNumEltsPerSmemStageKv.
     if (mDtypeKv == tg::Dtype::E2m1 && !mStoreTransformedKvInTmem) {
       // When mStoreTransformedKvInTmem is false, input FP4 elements are packed in 8-bit
@@ -789,10 +824,10 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
       // mStoreTransformedKvInTmem is true, since CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B is used
       // for TMA loading, each 8 4-bit elements are padded to 16B. In average, each element
       // occupies 8 bit, therefore no need to halve the number of elements.
-      mNumEltsPerSmemStageKv = mSmemKvTileSize / 2 + smemKvSfTileSize;
+      mNumEltsPerSmemStageKv = mSmemKvTileSize / 2 + mNumSfEltsPerSmemStageKv;
     } else {
       // The number of elements per stage for K/V.
-      mNumEltsPerSmemStageKv = mSmemKvTileSize + smemKvSfTileSize;
+      mNumEltsPerSmemStageKv = mSmemKvTileSize + mNumSfEltsPerSmemStageKv;
     }
 
     // Align each SMEM stage to 1024B when mStoreTransformedKvInTmem is true, as SWIZZLE_128B is
@@ -823,7 +858,7 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
                            : 1;
 
     // Calculate the transaction size for K/V.
-    mNumTxBytesKv = tileSizeNB * maxHeadSizeBytesKv + smemKvSfTileSize * 1 /*byte per sf element*/;
+    mNumTxBytesKv = tileSizeNB * maxHeadSizeBytesKv + smemKvSfTxSize * 1 /*byte per sf element*/;
     // Align the transaction size to 128B for TMA loading.
     if (headDimBytesKv > 128) {
       mNumTxBytesKv = (mNumTxBytesKv / headDimBytesKv) * ceilDiv(headDimBytesKv, 128) * 128;
