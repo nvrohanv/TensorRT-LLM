@@ -294,10 +294,11 @@ bool XqaDispatcher::isSupported()
         // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
         // ContiguousKv must use 0 so hash matches registered cubins.
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
-        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
-        // the kernel is supported.
+        // Set the chunked attention size and sliding window size to disabled when checking if
+        // the kernel is supported. (-1, -1) is the FA4 "unbounded" sentinel.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
-        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
         // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
         // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
         tllmRunnerParams.mBatchSize = 1;
@@ -505,8 +506,19 @@ void XqaDispatcher::runImpl(
             ? params.max_attention_window_size
             : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
-        // The sliding window attention size.
-        tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
+        // The sliding window attention size. XQA uses causal-sliding semantics, so translate
+        // single-window W into FA4 (L, R) = (W - 1, 0). W <= 0 or sentinel INT_MAX means
+        // "no window" -> (-1, -1).
+        if (params.cyclic_attention_window_size > 0 && params.cyclic_attention_window_size != INT_MAX)
+        {
+            tllmRunnerParams.mLeftSlidingWindow = params.cyclic_attention_window_size - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
+        else
+        {
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
         tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
