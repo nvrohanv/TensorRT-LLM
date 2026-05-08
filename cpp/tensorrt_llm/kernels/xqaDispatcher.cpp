@@ -523,7 +523,7 @@ void XqaDispatcher::runImpl(
         // pick the same kernel bucket (no JIT miss)
         tllmRunnerParams.mMaskType = tllmRunnerParams.mIsSpecDecTree
             ? TrtllmGenAttentionMaskType::Custom
-            : (params.is_sliding_window ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+            : (params.is_sliding_window ? TrtllmGenAttentionMaskType::SlidingWindow
                                         : TrtllmGenAttentionMaskType::Causal);
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;

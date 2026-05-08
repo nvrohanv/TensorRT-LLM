@@ -150,10 +150,14 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Dense";
   case AttentionMaskType::Causal:
     return "Causal";
-  case AttentionMaskType::SlidingOrChunkedCausal:
-    return "SlidingOrChunkedCausal";
+  case AttentionMaskType::SlidingWindow:
+    return "SlidingWindow";
   case AttentionMaskType::Custom:
     return "Custom";
+  case AttentionMaskType::ChunkedCausal:
+    return "ChunkedCausal";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     return "";
   }

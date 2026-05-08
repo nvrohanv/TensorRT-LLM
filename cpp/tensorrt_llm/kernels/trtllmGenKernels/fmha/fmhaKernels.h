@@ -360,7 +360,7 @@ public:
             TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
 
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-            const CUfunction func = findIter->second.mDeviceFunction;
+            CUfunction const func = findIter->second.mDeviceFunction;
 
             // mGroupsHeadsQ and mGroupsTokensHeadsQ are not part of the hashID, so they don't
             // affect kernel lookup. Use cubin-side values from kernelMeta instead of AutoTuner
@@ -371,10 +371,12 @@ public:
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
-                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, fmhaData.mMetaData.kvPageIdxD,
-                fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
-                fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
-                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, /*slidingWindowKvPoolBasePtr=*/nullptr,
+                fmhaData.mMetaData.kvPageIdxD, fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D,
+                fmhaData.mScales.kvSfScaleD, fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
+                fmhaData.mInputBuffers.customMaskOffsetsPtrD, /*sparseMlaTopKLensPtrD=*/nullptr,
+                /*variableWindowTokenStartsD=*/nullptr,
+                /*variableWindowTokenEndsD=*/nullptr, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
                 fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
                 fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
                 fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
@@ -708,7 +710,7 @@ private:
         fmhaData.mOutputBuffers.partialOPtrD = fmhaData.mOutputBuffers.partialStatsPtrD + partialStatsBufferSize;
         fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD = nullptr; // Not available in params (would need to be added)
         fmhaData.mOutputBuffers.softmaxStatsD = params.softmaxStatsPtr;
-        fmhaData.mOutputBuffers.oDebugPtrD = nullptr;           // Debug output not supported in TensorRT-LLM
+        fmhaData.mOutputBuffers.oDebugPtrD = nullptr; // Debug output not supported in TensorRT-LLM
 
         // Print all primitive type variables in FmhaData for debugging
     }
@@ -777,7 +779,16 @@ private:
 
         // Attention features
         options.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
-        options.mAttentionWindowSize = params.mAttentionWindowSize;
+        if (params.mAttentionWindowSize > 0)
+        {
+            options.mLeftSlidingWindow = params.mAttentionWindowSize - 1;
+            options.mRightSlidingWindow = 0;
+        }
+        else
+        {
+            options.mLeftSlidingWindow = -1;
+            options.mRightSlidingWindow = -1;
+        }
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
         // Sparse attention (MLA / MQA / GQA)
@@ -1060,7 +1071,7 @@ class TllmFmhaKernelFactory
 public:
     using KernelType = TllmGenFmhaKernel;
 
-    KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
+    KernelType* getKernels(typename KernelType::KernelMeta const* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
         Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
         int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
     {
@@ -1130,7 +1141,7 @@ private:
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41);
     }
 
-    std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
+    std::unordered_map<uint64_t, std::unique_ptr<KernelType> const> mKernels;
 };
 
 inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,

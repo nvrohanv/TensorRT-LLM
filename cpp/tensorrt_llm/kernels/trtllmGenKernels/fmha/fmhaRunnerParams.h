@@ -35,10 +35,19 @@ enum class TrtllmGenAttentionMaskType
     Dense = 0,
     // Causal mask.
     Causal,
-    // Sliding window or chunked causal mask.
-    SlidingOrChunkedCausal,
+    // Sliding window mask, parameterised by (leftSlidingWindow, rightSlidingWindow). FA4-aligned
+    // semantics: leftSlidingWindow = L and rightSlidingWindow = R define the inclusive K range
+    // [q - L, q + R]. (L = W-1, R = 0) is causal sliding window of W tokens; (L = R) is the
+    // symmetric bidirectional sliding window of (2L + 1) tokens.
+    SlidingWindow,
     // Custom mask.
-    Custom
+    Custom,
+    // Chunked-causal attention. Independent shape from SlidingWindow: queries attend within a
+    // power-of-two chunk of size mChunkedAttentionSize.
+    ChunkedCausal,
+    // Per-token contiguous window. The kernel reads one inclusive [start, end] K range per Q token
+    // from packed-Q arrays. This covers any mask that is one continuous K interval per Q row.
+    VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -53,10 +62,19 @@ enum class TrtllmGenAttentionMaskType
 
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindow)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(ChunkedCausal)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+// Used by the trtllm-gen export (FmhaOptions.h, KernelTraits.h) to gate the
+// shape-boolean derivation in normalizeFmhaOptions.
+inline bool isAnySlidingWindowMask(TrtllmGenAttentionMaskType maskType)
+{
+    return isSlidingWindowMask(maskType) || isChunkedCausalMask(maskType) || isVariableWindowMask(maskType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -294,10 +312,11 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
-    // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
-    // mAttentionWindowSize).
-    int mAttentionWindowSize;
-    // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
+    // Sliding-window bounds (FA4 convention; counts EXCLUDE the current token). -1 = unbounded;
+    // 0 = edge at q.
+    int mLeftSlidingWindow;
+    int mRightSlidingWindow;
+    // Chunked-attention size. INT_MAX = no chunking (sentinel preserved for upstream callers).
     int mChunkedAttentionSize;
     // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
     int mSumOfSeqLensQ;
@@ -346,7 +365,9 @@ struct TllmGenFmhaRunnerParams
             mMaskType = TrtllmGenAttentionMaskType::Causal;
             break;
         case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
-            mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+            // NOTE: TrtllmGenAttentionMaskType::SlidingOrChunkedCausal was removed.
+            //       Currently setting to SlidingWindow as a workaround.
+            mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
             break;
         case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
@@ -406,7 +427,7 @@ struct TllmGenSelectKernelParams
         , mTileSizeQ(128)
         , mTileSizeKv(128)
         , mUses2CtaMma(false)
-        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f) {};
 };
 
 } // namespace kernels
