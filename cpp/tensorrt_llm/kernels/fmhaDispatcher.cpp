@@ -111,7 +111,16 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mRightSlidingWindow = -1;
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
+            tllmRunnerParams.mLeftSlidingWindow = 1;
+            tllmRunnerParams.mRightSlidingWindow = 1;
+        }
+        else
+        {
+            tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        }
         if (mFixedParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
         {
             tllmRunnerParams.mLeftSlidingWindow = 0;
@@ -198,7 +207,14 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindow;
+        }
+        else
+        {
+            tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        }
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         // Always use persistent scheduler for better performance.
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;

@@ -673,6 +673,7 @@ private:
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
+        fmhaData.mMetaData.sparseMlaTopKLensPtrD = nullptr;
         fmhaData.mMetaData.variableWindowTokenStartsD = params.variableWindowTokenStartsPtr;
         fmhaData.mMetaData.variableWindowTokenEndsD = params.variableWindowTokenEndsPtr;
 

@@ -507,6 +507,18 @@ void XqaDispatcher::runImpl(
             ? params.max_attention_window_size
             : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
+        // XQA uses causal-sliding semantics, so translate single-window W into
+        // FA4 (L, R) = (W - 1, 0). W <= 0 or sentinel INT_MAX means "no window".
+        if (params.cyclic_attention_window_size > 0 && params.cyclic_attention_window_size != INT_MAX)
+        {
+            tllmRunnerParams.mLeftSlidingWindow = params.cyclic_attention_window_size - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
+        else
+        {
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
         tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
@@ -525,11 +537,6 @@ void XqaDispatcher::runImpl(
             ? TrtllmGenAttentionMaskType::Custom
             : (params.is_sliding_window ? TrtllmGenAttentionMaskType::SlidingWindow
                                         : TrtllmGenAttentionMaskType::Causal);
-        if (params.is_sliding_window)
-        {
-            tllmRunnerParams.mLeftSlidingWindow = params.cyclic_attention_window_size - 1;
-            tllmRunnerParams.mRightSlidingWindow = 0;
-        }
         if (!tllmRunnerParams.mIsSpecDecTree && params.chunked_attention_size != INT_MAX
             && params.chunked_attention_size > 0)
         {
