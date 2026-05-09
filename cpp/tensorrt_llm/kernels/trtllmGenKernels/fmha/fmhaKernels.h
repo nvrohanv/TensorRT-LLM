@@ -404,7 +404,8 @@ public:
 private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool hasLeftSlidingBound,
+        bool hasRightSlidingBound) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -434,6 +435,8 @@ private:
         // Bit 54 - 54: uses2CtaMma.
         // Bit 55 - 56: sparseAttention.
         // Bit 57 - 57: skipsSoftmax.
+        // Bit 58 - 58: hasLeftSlidingBound.
+        // Bit 59 - 59: hasRightSlidingBound.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -442,7 +445,8 @@ private:
             | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 57);
+            | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(hasLeftSlidingBound) << 58)
+            | (static_cast<uint64_t>(hasRightSlidingBound) << 59);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -450,7 +454,8 @@ private:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+            kernelMeta.mHasLeftSlidingBound, kernelMeta.mHasRightSlidingBound);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -478,7 +483,9 @@ private:
             + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
-            + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
+            + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible)
+            + ", hasLeftSlidingBound=" + std::to_string(options.mHasLeftSlidingBound)
+            + ", hasRightSlidingBound=" + std::to_string(options.mHasRightSlidingBound);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
         return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
@@ -487,7 +494,8 @@ private:
                                   static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
+                                  options.mHasLeftSlidingBound, options.mHasRightSlidingBound),
             info);
     }
 
@@ -985,6 +993,12 @@ private:
     std::pair<uint64_t, std::string> hashFromRunnerParams(
         RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
     {
+        bool const isSlidingWindow
+            = selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::SlidingWindow;
+        bool const isVariableWindow
+            = selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::VariableWindow;
+        bool const hasLeftSlidingBound = isVariableWindow || (isSlidingWindow && params.mLeftSlidingWindow >= 0);
+        bool const hasRightSlidingBound = isVariableWindow || (isSlidingWindow && params.mRightSlidingWindow > 0);
 
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
@@ -1007,7 +1021,9 @@ private:
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
             + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
-            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
+            + ", hasLeftSlidingBound=" + std::to_string(hasLeftSlidingBound)
+            + ", hasRightSlidingBound=" + std::to_string(hasRightSlidingBound);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
@@ -1018,7 +1034,7 @@ private:
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
-                selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mSkipsSoftmaxWhenPossible, hasLeftSlidingBound, hasRightSlidingBound),
             info);
     }
 
