@@ -29,8 +29,6 @@ typedef unsigned long __nv_fp8x8_storage_t;
 namespace trtllm {
 namespace dev {
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 inline __device__ void ldsmUnpackFp4Mode8x16Numx2(uint32_t& out0,
                                                   uint32_t& out1,
                                                   void const* srcMem) {

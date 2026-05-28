@@ -541,6 +541,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mFuseEpilogueIntoCorr, true, bool)                                                       \
   /* Whether to transform K/V in the correction task. */                                           \
   X(bool, mFuseTransformKvIntoCorr, true, bool)                                                    \
+  /* Whether to allocate separate transformed-K/V resources with independent pipelines. */         \
+  X(bool, mSeparateTransformedKv, false, bool)                                                     \
   /* Whether to group the headsQ into one CTA. */                                                  \
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
@@ -616,6 +618,10 @@ template <> inline std::string toString(MmaOrder e) {
   /* Signal at the last N remaining exps to cover the */                                           \
   X(int, mNumLeadingExpElts, 6, int)                                                               \
   X(int, mNumPrefetchedFmas, 4, int)                                                               \
+  /* The number of stages of the K/V shared memory buffer. 0 uses the default heuristic. */        \
+  X(int32_t, mNumStagesKv, 0, int32_t)                                                             \
+  /* The number of stages of the Q shared memory buffer. 0 uses the default heuristic. */          \
+  X(int32_t, mNumStagesQ, 0, int32_t)                                                              \
   /* The paged-kv configurations. The number of tokens in one pageKv. */                           \
   X(int32_t, mNumTokensPerPage, 32, int32_t)                                                       \
   /* How many warps are doing V transposition */                                                   \

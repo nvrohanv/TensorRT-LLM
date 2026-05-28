@@ -215,8 +215,10 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
-        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
-            && options.mDtypeKv != tg::Dtype::E2m1;
+        // return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
+            // && options.mDtypeKv != tg::Dtype::E2m1;
+        (void) options;
+        return false;
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const

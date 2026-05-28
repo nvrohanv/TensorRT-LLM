@@ -22,69 +22,74 @@
 #include "FastMath.h"
 #include "StoreSmemP.h"
 #include "Fp4Utils.h"
+#include "Fp8Utils.h"
 #include <cuda_bf16.h>
+#include <type_traits>
 
 namespace trtllm {
 namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int32_t NumRegs>
-inline __device__ void copyFromSmemToGmemAndConvertToE2m1(char const* src,
-                                                          char* dst,
-                                                          char* dstSf,
-                                                          float sfScale,
-                                                          bool isValidRow) {
-  static_assert(false, "Not implemented.");
-}
+template <typename DtypeOut, int32_t NumRegs>
+inline __device__ void copyFromSmemToGmemAndConvertToBlockScaled(char const* src,
+                                                                 char* dst,
+                                                                 char* dstSf,
+                                                                 float sfScale,
+                                                                 bool isValidStore,
+                                                                 bool storesSf) {
+  if constexpr (std::is_same_v<DtypeOut, cutlass::float_e2m1_t>) {
+    if constexpr (NumRegs == 2) {
+      // Load from SMEM.
+      auto in = reinterpret_cast<uint64_t const*>(src)[0];
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+      // Convert to E2m1.
+      cutlass::float_e4m3_t sfOut;
+      uint16_t valOut;
+      convertFp16ToE2m1<4>(valOut, sfOut, reinterpret_cast<uint32_t (&)[2]>(in), sfScale);
+      if (isValidStore) {
+        reinterpret_cast<uint16_t*>(dst)[0] = valOut;
+        if (storesSf) {
+          reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
+        }
+      }
+    } else if constexpr (NumRegs == 4) {
+      // Load from SMEM.
+      auto in = reinterpret_cast<cutlass::uint128_t const*>(src)[0];
 
-template <>
-inline __device__ void copyFromSmemToGmemAndConvertToE2m1<2>(char const* src,
-                                                             char* dst,
-                                                             char* dstSf,
-                                                             float sfScale,
-                                                             bool isValidRow) {
-  // Load from SMEM.
-  auto in = reinterpret_cast<uint64_t const*>(src)[0];
-
-  // Convert to E2m1.
-  cutlass::float_e4m3_t sfOut;
-  uint16_t valOut;
-  convertFp16ToE2m1<4>(valOut, sfOut, reinterpret_cast<uint32_t(&)[2]>(in), sfScale);
-  // Each group of 4 threads maps to the same SF.
-  if (isValidRow) {
-    // Store the output to GMEM. Each group of 4 threads maps to the same SF.
-    reinterpret_cast<uint16_t*>(dst)[0] = valOut;
-    if (threadIdx.x % 4 == 0) {
-      reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
+      // Convert to E2m1.
+      cutlass::float_e4m3_t sfOut;
+      uint32_t valOut;
+      convertFp16ToE2m1<8>(valOut, sfOut, reinterpret_cast<uint32_t (&)[4]>(in), sfScale);
+      if (isValidStore) {
+        reinterpret_cast<uint32_t*>(dst)[0] = valOut;
+        if (storesSf) {
+          reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
+        }
+      }
+    } else {
+      static_assert(NumRegs == 2 || NumRegs == 4, "Not implemented.");
     }
-  }
-}
+  } else if constexpr (std::is_same_v<DtypeOut, cutlass::float_e4m3_t>) {
+    static_assert(NumRegs == 4, "Not implemented.");
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Load 8 FP16 elements from SMEM.
+    auto in = reinterpret_cast<cutlass::uint128_t const*>(src)[0];
+    auto inU32 = reinterpret_cast<uint32_t const(&)[4]>(in);
 
-template <>
-inline __device__ void copyFromSmemToGmemAndConvertToE2m1<4>(char const* src,
-                                                             char* dst,
-                                                             char* dstSf,
-                                                             float sfScale,
-                                                             bool isValidRow) {
-  // Load from SMEM.
-  auto in = reinterpret_cast<cutlass::uint128_t const*>(src)[0];
-
-  // Convert to E2m1.
-  cutlass::float_e4m3_t sfOut;
-  uint32_t valOut;
-  convertFp16ToE2m1<8>(valOut, sfOut, reinterpret_cast<uint32_t(&)[4]>(in), sfScale);
-  // Each pair of threads maps to the same SF.
-  if (isValidRow) {
-    // Store the output to GMEM. Each pair of threads maps to the same SF.
-    reinterpret_cast<uint32_t*>(dst)[0] = valOut;
-    if (threadIdx.x % 2 == 0) {
-      reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
+    float vals[8];
+#pragma unroll
+    for (int32_t ii = 0; ii < 4; ++ii) {
+      float2 tmp = __half22float2(reinterpret_cast<half2 const&>(inU32[ii]));
+      vals[2 * ii + 0] = tmp.x;
+      vals[2 * ii + 1] = tmp.y;
     }
+
+    convertAndStoreToGmemAsMxE4m3<8>(dst, dstSf, vals, isValidStore, storesSf);
+  } else {
+    static_assert(std::is_same_v<DtypeOut, cutlass::float_e2m1_t> ||
+                    std::is_same_v<DtypeOut, cutlass::float_e4m3_t>,
+                  "Not implemented.");
   }
 }
 
@@ -123,7 +128,7 @@ template <int32_t NumRegs> struct StoreVec<NumRegs, true> {
     // Store the vector to remote smem.
     static_assert(NumRegs <= 4, "Not implemented.");
     cuda_ptx::st_async(reinterpret_cast<uint32_t*>(remoteSmemPtr),
-                       reinterpret_cast<uint32_t(&)[NumRegs]>(srcMemVec),
+                       reinterpret_cast<uint32_t (&)[NumRegs]>(srcMemVec),
                        barrier);
   }
 };
@@ -141,6 +146,7 @@ template <int32_t NumRegs,
           int32_t RowStrideSf,
           int32_t NumSfPerHead,
           bool CastToE2m1,
+          bool CastToMxE4m3,
           bool StoreToRemoteSmem,
           bool MapRowToHeadTokenIdx>
 inline __device__ void copyFromSmemToDstMem(char* smemPtr,
@@ -184,24 +190,31 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
       (smemRowIdx / NumRows) * NumBytesPerSmemRow + (baseOffset % NumBytesPerSmemRow);
   }
 
-  // Whether the row is valid.
+  // Whether the destination row/column fall within the compact output bounds. For non-power-of-2
+  // headDimV (for example 80), the swizzled SMEM tile is still padded to a wider NumCols, so we
+  // must suppress stores whose 16B vector starts past the real row width.
   bool isValidRow = dstMemRowIdx < numValidRows;
+  bool isValidCol = dstMemColOffset < dstMemRowStrideInBytes;
+  bool isValidStore = isValidRow && isValidCol;
 
   // Copy from shared memory to global memory.
-  if constexpr (CastToE2m1) {
+  if constexpr (CastToE2m1 || CastToMxE4m3) {
+    static_assert(!(CastToE2m1 && CastToMxE4m3), "Only one output conversion can be enabled.");
 
     //
     // Store the SFs in Layout128x4 (see trtllm/gen/DtypeUtils.h for details).
-    // All elements in the tile [numHeadsQPerKv (row), headDim (col)] are mapped to the col
-    // dimension of SFs.
+    // The SMEM tile stores FP16 values. GMEM stores either packed E2m1 values with E4M3 SFs, or
+    // E4M3 values with UE8M0 SFs.
     //
 
+    using DtypeBlockScaledOut =
+      std::conditional_t<CastToE2m1, cutlass::float_e2m1_t, cutlass::float_e4m3_t>;
     // Assume elements are stored in SMEM as FP16.
     int32_t constexpr NumBytesPerFp16Elt = 2;
-    // The number of E2m1 elements packed in a byte.
-    int32_t constexpr NumE2m1EltsPerByte = 2;
+    // The number of output elements packed in a byte.
+    int32_t constexpr NumEltsPerDstByte = CastToE2m1 ? 2 : 1;
     // The number of elements per sf.
-    int32_t constexpr NumEltsPerSf = 16;
+    int32_t constexpr NumEltsPerSf = CastToE2m1 ? 16 : 32;
     // The number of cols of SF per block.
     int32_t constexpr NumColsPerSfBlock = 4;
     // The size of each SF block.
@@ -240,13 +253,17 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
     // Compute data destination offset.
     int64_t dstMemOffset{dstMemRowIdx * static_cast<int64_t>(dstMemRowStrideInBytes) +
                          dstMemColOffset};
-    dstMemOffset = dstMemOffset / NumBytesPerFp16Elt / NumE2m1EltsPerByte;
+    dstMemOffset = dstMemOffset / NumBytesPerFp16Elt / NumEltsPerDstByte;
 
-    copyFromSmemToGmemAndConvertToE2m1<NumRegs>(smemPtr + loadSmemOffset,
-                                                dstMemPtr + dstMemOffset,
-                                                dstMemSf + dstMemSfOffset,
-                                                sfScale,
-                                                isValidRow);
+    bool storesSf = (dstMemColOffset / NumBytesPerFp16Elt % NumEltsPerSf) == 0;
+    bool const isValidBlockScaledStore = CastToE2m1 ? isValidRow : isValidStore;
+    copyFromSmemToGmemAndConvertToBlockScaled<DtypeBlockScaledOut, NumRegs>(
+      smemPtr + loadSmemOffset,
+      dstMemPtr + dstMemOffset,
+      dstMemSf + dstMemSfOffset,
+      sfScale,
+      isValidBlockScaledStore,
+      storesSf);
   } else {
     // If it groups both headsQ and tokensQ into one CTA, we need to unpack the row index to the
     // valid range if values are stored to finalO.
@@ -267,7 +284,7 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
         remoteSmemRowIdx * static_cast<int64_t>(dstMemRowStrideInBytes) + dstMemColOffset;
     }
 
-    if (isValidRow) {
+    if (isValidStore) {
       // The destination in GMEM/Remote SMEM.
       dstMemPtr += dstMemOffset;
       // The source in SMEM.
@@ -325,6 +342,7 @@ template <int32_t NumRows,
           class DtypeO,
           int NumRegs,
           bool CastToE2m1 = false,
+          bool CastToMxE4m3 = false,
           bool StoreToRemoteSmem = false,
           bool MapRowToHeadTokenIdx = false>
 inline __device__ void reorganizeInSmemAndStoreToDstMemImpl_(
@@ -340,7 +358,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemImpl_(
   int32_t numWarpGrpThreads,
   int32_t warpGrpThreadIdx,
   int32_t namedBarId,
-  cutlass::float_e4m3_t* dstMemPtrOSf = nullptr,
+  void* dstMemPtrOSf = nullptr,
   float sfScale = 0.f,
   int32_t sfBaseRowIdx = 0) {
 
@@ -353,6 +371,9 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemImpl_(
                 "Not implemented.");
   static_assert(!CastToE2m1 || std::is_same_v<DtypeO, cutlass::half_t>,
                 "DtypeO should be Fp16 if cast to E2M1.");
+  static_assert(!CastToMxE4m3 || std::is_same_v<DtypeO, cutlass::half_t>,
+                "DtypeO should be Fp16 if cast to MxE4m3.");
+  static_assert(!(CastToE2m1 && CastToMxE4m3), "Only one output conversion can be enabled.");
 
   // The number of rows and cols after transposing.
   int32_t constexpr NumTransRows{NumCols};
@@ -413,6 +434,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemImpl_(
                          RowStrideSf,
                          NumSfPerHead,
                          CastToE2m1,
+                         CastToMxE4m3,
                          StoreToRemoteSmem,
                          MapRowToHeadTokenIdx>(baseSmemPtr,
                                                baseDstMemPtr,
@@ -448,6 +470,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMem(DtypeO* smemPtrO,
                                         0,
                                         DtypeO,
                                         NumRegs,
+                                        false,
                                         false,
                                         false,
                                         MapRowToHeadTokenIdx>(smemPtrO,
@@ -491,6 +514,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMem(DtypeO* smemPtrO,
                                         0,
                                         DtypeO,
                                         NumRegs,
+                                        false,
                                         false,
                                         true,
                                         MapRowToHeadTokenIdx>(smemPtrO,
@@ -539,6 +563,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemAsE2m1(
                                         NumRegs,
                                         true,
                                         false,
+                                        false,
                                         MapRowToHeadTokenIdx>(smemPtrO,
                                                               dstMemPtrO,
                                                               static_cast<uint64_t*>(nullptr),
@@ -553,6 +578,55 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemAsE2m1(
                                                               namedBarId,
                                                               dstMemPtrOSf,
                                                               sfScale,
+                                                              sfBaseRowIdx);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int32_t NumRows,
+          int32_t NumCols,
+          int32_t RowStrideSf,
+          int32_t NumSfPerHead,
+          bool MapRowToHeadTokenIdx,
+          class DtypeO,
+          int NumRegs>
+inline __device__ void reorganizeInSmemAndStoreToDstMemAsMxE4m3(
+  DtypeO* smemPtrO,
+  void* dstMemPtrO,
+  uint32_t (&arrayO)[NumRegs],
+  int32_t dstMemRowStride,
+  int32_t numValidTokens,
+  int32_t numHeadsQ,
+  trtllm::dev::fast_mod_div numHeadsQPerKv,
+  int32_t numWarpGrpThreads,
+  int32_t warpGrpThreadIdx,
+  int32_t namedBarId,
+  cutlass::float_ue8m0_t* dstMemPtrOSf,
+  int32_t sfBaseRowIdx = 0) {
+
+  reorganizeInSmemAndStoreToDstMemImpl_<NumRows,
+                                        NumCols,
+                                        RowStrideSf,
+                                        NumSfPerHead,
+                                        DtypeO,
+                                        NumRegs,
+                                        false,
+                                        true,
+                                        false,
+                                        MapRowToHeadTokenIdx>(smemPtrO,
+                                                              dstMemPtrO,
+                                                              static_cast<uint64_t*>(nullptr),
+                                                              arrayO,
+                                                              dstMemRowStride,
+                                                              numValidTokens,
+                                                              numValidTokens,
+                                                              numHeadsQ,
+                                                              numHeadsQPerKv,
+                                                              numWarpGrpThreads,
+                                                              warpGrpThreadIdx,
+                                                              namedBarId,
+                                                              dstMemPtrOSf,
+                                                              0.f,
                                                               sfBaseRowIdx);
 }
 

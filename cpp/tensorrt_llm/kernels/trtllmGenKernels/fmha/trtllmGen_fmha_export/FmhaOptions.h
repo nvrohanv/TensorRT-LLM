@@ -19,6 +19,7 @@
 #include "KernelTraits.h"
 #include <trtllm/gen/CudaArchDecl.h>
 #include <trtllm/gen/CudaRunner.h>
+#include <trtllm/gen/DtypeUtils.h>
 #include <nlohmann/json.hpp>
 #include <cfloat>
 #include <string>
@@ -71,6 +72,8 @@ struct FmhaOptions : public KernelConfigBase {
   bool mDryRun{false};
   // Enable the auto tuner.
   bool mEnablesAutoTuner{false};
+  // Enable the BF16Q+FP8KV K-only transform path. Disabled by default.
+  bool mEnablesBf16QFp8KvKOnlyTransform{false};
   // Whether is exporting cubin.
   bool mIsExportingCubin{false};
 
@@ -109,6 +112,10 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
+  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
+  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
+  // uses it as a deterministic upper bound for kernel selection.
+  int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
   // The maximum number of waves for the multiCtasKvMode.
@@ -150,6 +157,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mRightSlidingWindow);
     TO_JSON(mDryRun);
     TO_JSON(mEnablesAutoTuner);
+    TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
     TO_JSON(mIsTracing);
     TO_JSON(mMaxNumCtasPerSeqKv);
@@ -167,6 +175,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
+    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
@@ -390,10 +399,18 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // mNumInstsKv == 1 are supported.
   TLLM_CHECK_ERROR(((options.mNumInstsQ * options.mNumInstsKv) <= 2),
                    "Only two tile instances are supported");
+  if (isBf16QFp8KvFullTransformGeneration(options)) {
+    TLLM_CHECK_ERROR(options.mNumInstsQ == 1 && options.mNumInstsKv == 1,
+                     "BF16Q+FP8KV full-transform kernels require numInstsQ == 1 and "
+                     "numInstsKv == 1.");
+  }
 
   // The number of instances for Q and Kv must be set together.
   TLLM_CHECK_ERROR(optionsFromArgs.mIsNumInstsQSet == optionsFromArgs.mIsNumInstsKvSet,
                    "The number of instances for Q and Kv must be set together");
+
+  TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+  TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
 
   // Do we swap A/B for the generation kernel.
   bool const swapsMmaAb{isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType)};
@@ -419,8 +436,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Check if head dim is valid.
   auto headDimQk{options.mHeadDimQk}, headDimV{options.mHeadDimV};
   if (swapsMmaAb && headDimQk == headDimV) {
-    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256 || headDimQk == 512,
-                     "The headDim must be 64, 128, 256 or 512");
+    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 80 || headDimQk == 128 || headDimQk == 256 ||
+                       headDimQk == 512,
+                     "The headDim must be 64, 80, 128, 256 or 512");
   }
   // MLA kernels.
   if (headDimQk != headDimV) {
@@ -429,8 +447,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                        "Only headDimQk > headDimV MLA kernels have been verified for Hopper");
     } else {
       if (isContextKernel(options.mFmhaKernelType)) {
-        TLLM_CHECK_ERROR(headDimQk == 192 && headDimV == 128,
-                         "Only headDimQk = 192, headDimV = 128 MLA kernels have been verified");
+        TLLM_CHECK_ERROR((headDimQk == 192 && headDimV == 128) ||
+                           (headDimQk == 128 && headDimV == 64),
+                         "Only headDimQk = 192, headDimV = 128 (DeepSeek context MLA) or "
+                         "headDimQk = 128, headDimV = 64 (Mistral Small 4 context MLA) kernels "
+                         "have been verified");
       } else {
         TLLM_CHECK_ERROR(options.mIsMlaGen && ((headDimQk == 576 && headDimV == 512) ||
                                                (headDimQk == 320 && headDimV == 256)),
@@ -535,17 +556,25 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "(mChunkedAttentionSize - 1, 0); use normalizeFmhaOptions to derive these.");
   }
 
-  // Special options for FP4.
-  if (options.mDtypeOut == tg::Dtype::E2m1) {
-    // FP4 output only supports fuseEpilogueIntoCorr.
-    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                     "FP4 output only supports fuseEpilogueIntoCorr");
-    // Make sure the number of sf per row can be divided by 4, required for interleaved SF layout.
-    // Details can be seen in DtypeUtils.h: E2m1Utils::getSfOffset.
-    int32_t hiddenDim = options.mNumHeadsQ * headDimQk;
-    auto kernelTraits = getKernelTraitsFromOptions(options);
-    TLLM_CHECK_ERROR((hiddenDim / kernelTraits.mNumEltsPerSf) % 4 == 0,
-                     "Current hiddenDim is not supported for FP4 output");
+  // Special options for block-scaled outputs.
+  if (options.mDtypeOut == tg::Dtype::E2m1 || options.mDtypeOut == tg::Dtype::MxE4m3) {
+    if (options.mDtypeOut == tg::Dtype::E2m1) {
+      TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                       "E2m1 output only supports fuseEpilogueIntoCorr");
+    } else {
+      TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                       "MxE4m3 output only supports fuseEpilogueIntoCorr");
+    }
+
+    // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
+    int32_t numEltsPerSf = tg::dtypeNumEltsPerSf(options.mDtypeOut);
+    int32_t hiddenDim = options.mNumHeadsQ * options.mHeadDimV;
+    TLLM_CHECK_ERROR(options.mHeadDimV % numEltsPerSf == 0,
+                     "headDimV must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR(hiddenDim % numEltsPerSf == 0,
+                     "hiddenDim must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR((hiddenDim / numEltsPerSf) % tg::SfUtils::Layout128x4::NumColsPerSfBlock == 0,
+                     "Current hiddenDim is not compatible with interleaved SF layout");
   }
 
   // If we decide to use Sage Attention, the number of elements per block must be a power-of-two.
@@ -643,8 +672,6 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(options.mDtypeKv != tg::Dtype::E2m1,
-                     "mGroupsTokensHeadsQ doesn't work with E2m1 dtypeKv.");
     TLLM_CHECK_ERROR(!options.mIsMlaGen,
                      "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
   }
@@ -655,6 +682,21 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mDtypeQ != options.mDtypeKv) {
     TLLM_CHECK_ERROR(options.mMmaOrder == MmaOrder::Pv0_Qk0_Pv1_Qk1,
                      "Only MMA order Pv0_Qk0_Pv1_Qk1 is supported for transformed K/V.");
+  }
+  if (options.mEnablesBf16QFp8KvKOnlyTransform) {
+    TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
+                     "BF16Q+FP8KV K-only transform is only supported for non-MLA Blackwell "
+                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128.");
+    TLLM_CHECK_ERROR(!options.mSeparateTransformedKv,
+                     "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
+  }
+  if (options.mSeparateTransformedKv) {
+    TLLM_CHECK_ERROR(!usesKOnlyTransformPipeline(options),
+                     "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
+    TLLM_CHECK_ERROR(supportsSeparateTransformedKv(options),
+                     "separateTransformedKv is only supported by BF16Q+E4M3KV full-transform "
+                     "generation kernels on Blackwell with numInstsQ=1, numInstsKv=1, and equal "
+                     "H64/H128 K/V heads.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
@@ -678,7 +720,7 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
   // Set default absolute/relative tolerance for different data types.
   if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
     // Use smaller tolerance for float16/bfloat16 if it is not set.
-    if (options.mDtypeOut == tg::Dtype::E4m3) {
+    if (options.mDtypeOut == tg::Dtype::E4m3 || options.mDtypeOut == tg::Dtype::MxE4m3) {
       if (!optionsFromArgs.mIsAtolSet) {
         options.mAtol = 2e-2f;
       }
