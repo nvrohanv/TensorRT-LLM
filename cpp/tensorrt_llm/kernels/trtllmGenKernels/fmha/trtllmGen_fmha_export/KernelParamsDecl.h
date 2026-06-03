@@ -93,8 +93,7 @@ struct KernelParams {
   // The SF scale for Kv on device. Only needed by trt-llm kernels as the scales have to be on the
   // device currently.
   float const* ptrScaleSfKv;
-  // The scalar scale for E2m1 output O on device. MxE4m3 output stores per-block UE8M0 scales in
-  // ptrSfO and does not use this scalar.
+  // The scalar scale for block-scaled output O on device.
   float const* ptrScaleSfO;
   // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
   // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
@@ -187,7 +186,7 @@ struct KernelParams {
   float mScaleSoftmaxLog2;
   // The SF scale for Kv.
   float mScaleSfKv;
-  // The scalar SF scale for E2m1 output O.
+  // The scalar SF scale for output O.
   float mScaleSfO;
   // Threshold to decide whether warp skips softmax ops
   float mSkipSoftmaxThresholdScaleFactor;

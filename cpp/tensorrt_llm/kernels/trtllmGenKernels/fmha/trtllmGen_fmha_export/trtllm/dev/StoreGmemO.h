@@ -23,6 +23,7 @@
 #include "StoreSmemP.h"
 #include "Fp4Utils.h"
 #include "Fp8Utils.h"
+#include "ReduceMultiCtasKvUtils.h"
 #include <cuda_bf16.h>
 #include <type_traits>
 
@@ -32,65 +33,19 @@ namespace dev {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename DtypeOut, int32_t NumRegs>
-inline __device__ void copyFromSmemToGmemAndConvertToBlockScaled(char const* src,
+inline __device__ void copyFromSmemToGmemAndConvertToBlockScaled(char* src,
                                                                  char* dst,
                                                                  char* dstSf,
                                                                  float sfScale,
-                                                                 bool isValidStore,
-                                                                 bool storesSf) {
-  if constexpr (std::is_same_v<DtypeOut, cutlass::float_e2m1_t>) {
-    if constexpr (NumRegs == 2) {
-      // Load from SMEM.
-      auto in = reinterpret_cast<uint64_t const*>(src)[0];
+                                                                 bool isValidRow) {
+  static_assert(std::is_same_v<DtypeOut, cutlass::float_e2m1_t> ||
+                  std::is_same_v<DtypeOut, cutlass::float_e4m3_t>,
+                "DtypeOut Not implemented.");
+  static_assert(NumRegs == 2 || NumRegs == 4, "Only 2 or 4 registers are allowed.");
+  // Load from SMEM.
+  cutlass::half_t(&vals)[NumRegs * 2] = reinterpret_cast<cutlass::half_t(&)[NumRegs * 2]>(src[0]);
 
-      // Convert to E2m1.
-      cutlass::float_e4m3_t sfOut;
-      uint16_t valOut;
-      convertFp16ToE2m1<4>(valOut, sfOut, reinterpret_cast<uint32_t (&)[2]>(in), sfScale);
-      if (isValidStore) {
-        reinterpret_cast<uint16_t*>(dst)[0] = valOut;
-        if (storesSf) {
-          reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
-        }
-      }
-    } else if constexpr (NumRegs == 4) {
-      // Load from SMEM.
-      auto in = reinterpret_cast<cutlass::uint128_t const*>(src)[0];
-
-      // Convert to E2m1.
-      cutlass::float_e4m3_t sfOut;
-      uint32_t valOut;
-      convertFp16ToE2m1<8>(valOut, sfOut, reinterpret_cast<uint32_t (&)[4]>(in), sfScale);
-      if (isValidStore) {
-        reinterpret_cast<uint32_t*>(dst)[0] = valOut;
-        if (storesSf) {
-          reinterpret_cast<cutlass::float_e4m3_t*>(dstSf)[0] = sfOut;
-        }
-      }
-    } else {
-      static_assert(NumRegs == 2 || NumRegs == 4, "Not implemented.");
-    }
-  } else if constexpr (std::is_same_v<DtypeOut, cutlass::float_e4m3_t>) {
-    static_assert(NumRegs == 4, "Not implemented.");
-
-    // Load 8 FP16 elements from SMEM.
-    auto in = reinterpret_cast<cutlass::uint128_t const*>(src)[0];
-    auto inU32 = reinterpret_cast<uint32_t const(&)[4]>(in);
-
-    float vals[8];
-#pragma unroll
-    for (int32_t ii = 0; ii < 4; ++ii) {
-      float2 tmp = __half22float2(reinterpret_cast<half2 const&>(inU32[ii]));
-      vals[2 * ii + 0] = tmp.x;
-      vals[2 * ii + 1] = tmp.y;
-    }
-
-    convertAndStoreToGmemAsMxE4m3<8>(dst, dstSf, vals, isValidStore, storesSf);
-  } else {
-    static_assert(std::is_same_v<DtypeOut, cutlass::float_e2m1_t> ||
-                    std::is_same_v<DtypeOut, cutlass::float_e4m3_t>,
-                  "Not implemented.");
-  }
+  convertAndStoreToGmem<DtypeOut>(dst, dstSf, vals, sfScale, isValidRow);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -255,15 +210,12 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
                          dstMemColOffset};
     dstMemOffset = dstMemOffset / NumBytesPerFp16Elt / NumEltsPerDstByte;
 
-    bool storesSf = (dstMemColOffset / NumBytesPerFp16Elt % NumEltsPerSf) == 0;
-    bool const isValidBlockScaledStore = CastToE2m1 ? isValidRow : isValidStore;
     copyFromSmemToGmemAndConvertToBlockScaled<DtypeBlockScaledOut, NumRegs>(
       smemPtr + loadSmemOffset,
       dstMemPtr + dstMemOffset,
       dstMemSf + dstMemSfOffset,
       sfScale,
-      isValidBlockScaledStore,
-      storesSf);
+      isValidRow);
   } else {
     // If it groups both headsQ and tokensQ into one CTA, we need to unpack the row index to the
     // valid range if values are stored to finalO.
@@ -551,7 +503,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemAsE2m1(
   int32_t numWarpGrpThreads,
   int32_t warpGrpThreadIdx,
   int32_t namedBarId,
-  cutlass::float_e4m3_t* dstMemPtrOSf,
+  void* dstMemPtrOSf,
   float sfScale,
   int32_t sfBaseRowIdx = 0) {
 
@@ -601,7 +553,8 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemAsMxE4m3(
   int32_t numWarpGrpThreads,
   int32_t warpGrpThreadIdx,
   int32_t namedBarId,
-  cutlass::float_ue8m0_t* dstMemPtrOSf,
+  void* dstMemPtrOSf,
+  float sfScale,
   int32_t sfBaseRowIdx = 0) {
 
   reorganizeInSmemAndStoreToDstMemImpl_<NumRows,
@@ -626,7 +579,7 @@ inline __device__ void reorganizeInSmemAndStoreToDstMemAsMxE4m3(
                                                               warpGrpThreadIdx,
                                                               namedBarId,
                                                               dstMemPtrOSf,
-                                                              0.f,
+                                                              sfScale,
                                                               sfBaseRowIdx);
 }
 

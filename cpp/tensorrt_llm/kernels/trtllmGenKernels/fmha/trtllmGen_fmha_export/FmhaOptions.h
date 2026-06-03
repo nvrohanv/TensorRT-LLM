@@ -19,7 +19,6 @@
 #include "KernelTraits.h"
 #include <trtllm/gen/CudaArchDecl.h>
 #include <trtllm/gen/CudaRunner.h>
-#include <trtllm/gen/DtypeUtils.h>
 #include <nlohmann/json.hpp>
 #include <cfloat>
 #include <string>
@@ -267,8 +266,7 @@ inline void normalizeFmhaOptions(FmhaOptions& options) {
   }
 
   // Infer the mask type from options that imply a non-dense mask.
-  bool const newSidesSet =
-    options.mLeftSlidingWindow != -1 || options.mRightSlidingWindow != -1;
+  bool const newSidesSet = options.mLeftSlidingWindow != -1 || options.mRightSlidingWindow != -1;
   if (options.mChunkedAttentionSize > 0 &&
       (options.mMaskType == AttentionMaskType::Dense ||
        options.mMaskType == AttentionMaskType::SlidingWindow)) {
@@ -290,8 +288,8 @@ inline void normalizeFmhaOptions(FmhaOptions& options) {
   }
 
   // SlidingWindow with both sides unbounded is dense.
-  if (isSlidingWindowMask(options.mMaskType) &&
-      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == -1) {
+  if (isSlidingWindowMask(options.mMaskType) && options.mLeftSlidingWindow == -1 &&
+      options.mRightSlidingWindow == -1) {
     options.mMaskType = AttentionMaskType::Dense;
   }
 
@@ -299,14 +297,18 @@ inline void normalizeFmhaOptions(FmhaOptions& options) {
   if (isSlidingWindowMask(options.mMaskType)) {
     if (options.mLeftSlidingWindow > options.mMaxSeqLenKv) {
       TLLM_LOG_WARNING(
-        "leftSlidingWindow (", options.mLeftSlidingWindow,
-        ") exceeds mMaxSeqLenKv (", options.mMaxSeqLenKv,
+        "leftSlidingWindow (",
+        options.mLeftSlidingWindow,
+        ") exceeds mMaxSeqLenKv (",
+        options.mMaxSeqLenKv,
         "); the kernel clamps the per-row reach but this likely indicates a config error.");
     }
     if (options.mRightSlidingWindow > options.mMaxSeqLenKv) {
       TLLM_LOG_WARNING(
-        "rightSlidingWindow (", options.mRightSlidingWindow,
-        ") exceeds mMaxSeqLenKv (", options.mMaxSeqLenKv,
+        "rightSlidingWindow (",
+        options.mRightSlidingWindow,
+        ") exceeds mMaxSeqLenKv (",
+        options.mMaxSeqLenKv,
         "); the kernel clamps the per-row reach but this likely indicates a config error.");
     }
   }
@@ -314,36 +316,41 @@ inline void normalizeFmhaOptions(FmhaOptions& options) {
   // A fully-bounded SlidingWindow that covers the whole sequence is better written as Causal or
   // Dense. VariableWindow is excluded because its per-token bounds can still narrow the range.
   if (isSlidingWindowMask(options.mMaskType)) {
-    int64_t const effectiveWindow =
-      static_cast<int64_t>(std::max(0, options.mLeftSlidingWindow)) +
-      static_cast<int64_t>(std::max(0, options.mRightSlidingWindow)) + 1;
+    int64_t const effectiveWindow = static_cast<int64_t>(std::max(0, options.mLeftSlidingWindow)) +
+                                    static_cast<int64_t>(std::max(0, options.mRightSlidingWindow)) +
+                                    1;
     bool const eitherSideUnbounded =
       options.mLeftSlidingWindow == -1 || options.mRightSlidingWindow == -1;
     if (!eitherSideUnbounded && effectiveWindow >= options.mMaxSeqLenKv) {
       char const* degenerate = (options.mRightSlidingWindow == 0) ? "Causal" : "Dense";
       char const* canonical = (options.mRightSlidingWindow == 0) ? "causal" : "dense";
-      TLLM_LOG_WARNING(
-        "SlidingWindow window (L + R + 1 = ", effectiveWindow,
-        ") covers the full mMaxSeqLenKv (", options.mMaxSeqLenKv,
-        "); this degenerates to ", degenerate, " - prefer -maskType ", canonical,
-        " for clarity.");
+      TLLM_LOG_WARNING("SlidingWindow window (L + R + 1 = ",
+                       effectiveWindow,
+                       ") covers the full mMaxSeqLenKv (",
+                       options.mMaxSeqLenKv,
+                       "); this degenerates to ",
+                       degenerate,
+                       " - prefer -maskType ",
+                       canonical,
+                       " for clarity.");
     }
   }
 
   // Plain SlidingWindow uses a finite right bound on device. R == -1 means "unbounded", so use
   // mMaxSeqLenKv - 1 as a large enough value.
   if (isSlidingWindowMask(options.mMaskType) && options.mRightSlidingWindow == -1) {
-    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType),
-                     "rightSlidingWindow == -1 (unbounded right) is only supported for context "
-                     "(prefill) kernels. Use rightSlidingWindow = 0 (causal) or pick a positive R.");
+    TLLM_CHECK_ERROR(
+      isContextKernel(options.mFmhaKernelType),
+      "rightSlidingWindow == -1 (unbounded right) is only supported for context "
+      "(prefill) kernels. Use rightSlidingWindow = 0 (causal) or pick a positive R.");
     TLLM_CHECK_ERROR(options.mMaxSeqLenKv > 0,
                      "rightSlidingWindow == -1 requires a positive mMaxSeqLenKv to clamp to.");
     options.mRightSlidingWindow = options.mMaxSeqLenKv - 1;
   }
 
   // SlidingWindow with unbounded left and R == 0 is just causal.
-  if (isSlidingWindowMask(options.mMaskType) &&
-      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == 0) {
+  if (isSlidingWindowMask(options.mMaskType) && options.mLeftSlidingWindow == -1 &&
+      options.mRightSlidingWindow == 0) {
     options.mMaskType = AttentionMaskType::Causal;
   }
 
@@ -360,16 +367,22 @@ inline void normalizeFmhaOptions(FmhaOptions& options) {
   }
 }
 
-// Validate FmhaOptions. Call after normalizeFmhaOptions and the autotuner. Pure validation -
-// does not mutate options.
+// Whether the output dtype produces per-block scale factors.
+inline bool hasOutputSfs(tg::Dtype dtype) {
+  return dtype == tg::Dtype::E2m1 || dtype == tg::Dtype::MxE4m3;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Check if the options are valid or not. Call after normalizeFmhaOptions and the autotuner. Pure
+// validation, does not mutate options.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
 
   // R > 0 makes per-CTA work nondeterministic on the K side, which generation-phase kernels
   // (1 token Q per CTA) cannot model correctly. The R == -1 unbounded case on a non-context
   // kernel is caught earlier in normalizeFmhaOptions with a more specific message.
-  TLLM_CHECK_ERROR(!(options.mRightSlidingWindow > 0 &&
-                     !isContextKernel(options.mFmhaKernelType)),
+  TLLM_CHECK_ERROR(!(options.mRightSlidingWindow > 0 && !isContextKernel(options.mFmhaKernelType)),
                    "rightSlidingWindow > 0 is only supported for context (prefill) kernels. "
                    "Generation-phase kernels are 1-token-per-CTA on Q and have no use for a "
                    "right-side window.");
@@ -377,8 +390,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Plain SlidingWindow needs at least one bounded side. VariableWindow gets its bounds from
   // per-token metadata arrays.
   if (isSlidingWindowMask(options.mMaskType)) {
-    TLLM_CHECK_ERROR(options.mLeftSlidingWindow >= 0 ||
-                       options.mRightSlidingWindow >= 0,
+    TLLM_CHECK_ERROR(options.mLeftSlidingWindow >= 0 || options.mRightSlidingWindow >= 0,
                      "SlidingWindow requires at least one bounded side. "
                      "Use -maskType dense if both sides are meant to be unbounded.");
   }
@@ -391,7 +403,6 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "VariableWindow does not support groupsTokensHeadsQ because "
                      "mGroupsTokensHeadsQ is only supported by generation kernels.");
   }
-
 
   TLLM_CHECK_ERROR(!(options.mGroupsHeadsQ && isPackedQkv(options.mQkvLayout)),
                    "Grouping Q heads doesn't work with the packedQkv layout");
@@ -557,23 +568,18 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   }
 
   // Special options for block-scaled outputs.
-  if (options.mDtypeOut == tg::Dtype::E2m1 || options.mDtypeOut == tg::Dtype::MxE4m3) {
-    if (options.mDtypeOut == tg::Dtype::E2m1) {
-      TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                       "E2m1 output only supports fuseEpilogueIntoCorr");
-    } else {
-      TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                       "MxE4m3 output only supports fuseEpilogueIntoCorr");
-    }
+  if (fmha::hasOutputSfs(options.mDtypeOut)) {
+    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                     "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
 
     // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
-    int32_t numEltsPerSf = tg::dtypeNumEltsPerSf(options.mDtypeOut);
+    int32_t numEltsPerSfO = tg::dtypeNumEltsPerSf(options.mDtypeOut);
     int32_t hiddenDim = options.mNumHeadsQ * options.mHeadDimV;
-    TLLM_CHECK_ERROR(options.mHeadDimV % numEltsPerSf == 0,
+    TLLM_CHECK_ERROR(options.mHeadDimV % numEltsPerSfO == 0,
                      "headDimV must be divisible by the output SF group size");
-    TLLM_CHECK_ERROR(hiddenDim % numEltsPerSf == 0,
+    TLLM_CHECK_ERROR(hiddenDim % numEltsPerSfO == 0,
                      "hiddenDim must be divisible by the output SF group size");
-    TLLM_CHECK_ERROR((hiddenDim / numEltsPerSf) % tg::SfUtils::Layout128x4::NumColsPerSfBlock == 0,
+    TLLM_CHECK_ERROR((hiddenDim / numEltsPerSfO) % 4 == 0,
                      "Current hiddenDim is not compatible with interleaved SF layout");
   }
 
@@ -720,7 +726,7 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
   // Set default absolute/relative tolerance for different data types.
   if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
     // Use smaller tolerance for float16/bfloat16 if it is not set.
-    if (options.mDtypeOut == tg::Dtype::E4m3 || options.mDtypeOut == tg::Dtype::MxE4m3) {
+    if (options.mDtypeOut == tg::Dtype::E4m3) {
       if (!optionsFromArgs.mIsAtolSet) {
         options.mAtol = 2e-2f;
       }

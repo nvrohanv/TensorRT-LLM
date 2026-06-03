@@ -488,45 +488,14 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     }
 
     // Convert the float values to DtypeO, and Store it to global memory.
-    if constexpr (std::is_same_v<DtypeO, cutlass::float_e4m3_t> &&
-                  std::is_same_v<DtypeSfO, cutlass::float_ue8m0_t>) {
+    constexpr bool IsMxE4m3Output = std::is_same_v<DtypeO, cutlass::float_e4m3_t> &&
+                                    std::is_same_v<DtypeSfO, cutlass::float_ue8m0_t>;
+    constexpr bool IsE2m1Output = std::is_same_v<DtypeO, cutlass::float_e2m1_t>;
+    if constexpr (IsMxE4m3Output || IsE2m1Output) {
+      // The number of output elements packed in a byte.
+      int32_t constexpr NumEltsPerDstByte = IsE2m1Output ? 2 : 1;
       // The number of elements per sf.
-      int32_t constexpr NumEltsPerSf = 32;
-      // The number of cols of SF per block.
-      int32_t constexpr NumColsPerSfBlock = 4;
-      // The size of each SF block.
-      int32_t constexpr NumBytesPerSfBlock = 512;
-
-      // The number of elements per sf.
-      int32_t constexpr HeadDimSf = HeadDim / NumEltsPerSf;
-      // The offset to store the SF value.
-      int64_t storeGmemSfOffset;
-
-      if constexpr (GroupsTokensHeadsQ) {
-        int32_t tokenIdx{validRowIdx / numHeadsQPerKvDivisor};
-        int32_t headIdxInGrp{validRowIdx % numHeadsQPerKvDivisor};
-        int32_t sfCol = headIdxInGrp * HeadDimSf + headDimIdx / NumEltsPerSf;
-        int32_t numSfPerRow{numHeadsQ * HeadDimSf};
-        storeGmemSfOffset = getSfOffset(sfBaseRowIdx + tokenIdx, sfCol, numSfPerRow);
-      } else {
-        // Without GroupsTokensHeadsQ, the SF pointer already accounts for the base head and token
-        // offsets.
-        int32_t sfColIdx = gmemStoreOffset / NumEltsPerSf;
-        storeGmemSfOffset =
-          sfColIdx / NumColsPerSfBlock * NumBytesPerSfBlock + sfColIdx % NumColsPerSfBlock;
-      }
-
-      convertAndStoreToGmemAsMxE4m3(reinterpret_cast<char*>(oPtr + gmemStoreOffset),
-                                    reinterpret_cast<char*>(oSfPtr) + storeGmemSfOffset,
-                                    outputVals,
-                                    isValidRow,
-                                    (headDimIdx % NumEltsPerSf) == 0);
-
-    } else if constexpr (std::is_same_v<DtypeO, cutlass::float_e2m1_t>) {
-      // The number of E2m1 elements packed in a byte.
-      int32_t constexpr NumE2m1EltsPerByte = 2;
-      // The number of elements per sf.
-      int32_t constexpr NumEltsPerSf = 16;
+      int32_t constexpr NumEltsPerSf = IsE2m1Output ? 16 : 32;
       // The number of cols of SF per block.
       int32_t constexpr NumColsPerSfBlock = 4;
       // The size of each SF block.
@@ -554,8 +523,9 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
         storeGmemSfOffset =
           sfColIdx / NumColsPerSfBlock * NumBytesPerSfBlock + sfColIdx % NumColsPerSfBlock;
       }
+
       convertAndStoreToGmem<DtypeO>(
-        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumE2m1EltsPerByte),
+        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumEltsPerDstByte),
         reinterpret_cast<char*>(oSfPtr) + storeGmemSfOffset,
         outputVals,
         sfScale,
