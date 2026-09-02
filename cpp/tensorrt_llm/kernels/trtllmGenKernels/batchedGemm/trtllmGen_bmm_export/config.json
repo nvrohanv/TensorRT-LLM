@@ -283,6 +283,32 @@
             ]
         },
         {
+            "_comment": "FP4_FC1_LowLatency_Extension",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": "tma",
+            "routeSfsAct": "tma",
+            "fusedAct": true,
+            "act": "swiglu",
+            "eltwiseActType": "none",
+            "sfLayoutA": "128x4",
+            "sfLayoutB": "linear",
+            "sfLayoutC": "8x4",
+            "useUnrollLoop2xForMma": false,
+            "dtypeC": "e2m1",
+            "mmaM": 128,
+            "mmaN": 8,
+            "tileN": 8,
+            "epilogueTileN": 8,
+            "tileK": 512,
+            "numSlicesForSplitK": 1,
+            "clusterDimX": 1,
+            "clusterDimZ": 1,
+            "numStages,tileScheduler,numStagesMma": [
+                [4, "static", 1],
+                [3, "persistent", 2]
+            ]
+        },
+        {
             "_comment": "FP4_FC1_SplitK_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": "tma",
@@ -477,6 +503,25 @@
             "tileScheduler,numStagesMma": [
                 ["static", 1],
                 ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency_Extension",
+            "_template": "BatchedGemmFp4LowLatency",
+            "smVersion": "100f",
+            "routeAct": false,
+            "fusedAct": false,
+            "dtypeB": "e2m1",
+            "dtypeC": "bf16",
+            "sfLayoutA": "128x4",
+            "sfLayoutC": "128x4",
+            "useTmaOobOpt": false,
+            "gridTriggerSecondaryB": false,
+            "gridWaitForPrimaryA": true,
+            "gridWaitForPrimaryB": true,
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages,tileScheduler,numStagesMma,useUnrollLoop2xForMma": [
+                [128, 8, 8, 8, 256, 1, 1, 1, 3, "static",     1, false],
+                [128, 8, 8, 8, 512, 1, 1, 1, 4, "persistent", 2, true]
             ]
         },
         {

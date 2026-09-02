@@ -77,9 +77,10 @@ namespace tg = trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// We do not differentiate between BatchedGemmOptions and BatchedGemmGatedActOptions for simplicity.
-// We inherit from GemmGatedActOptions, which is inherited from
-// GemmOptions to get GemmOptions and GemmGatedActOptions at the same time.
+// We do not differentiate between BatchedGemmOptions and
+// BatchedGemmGatedActOptions for simplicity. We inherit from
+// GemmGatedActOptions, which is inherited from GemmOptions to get GemmOptions
+// and GemmGatedActOptions at the same time.
 struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
 {
 
@@ -94,7 +95,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
 
     BatchedGemmOptions() = default;
 
-    // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
+    // FIXME We create explicit constructor with all options to WAR stubgen issue
+    // in TRT-LLM.
     BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, tg::Dtype biasDtype, gemm::BiasType biasType, int blockK,
         bool clcFastDrain, int clusterDimX, int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType,
         tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
@@ -213,8 +215,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     RouteImpl mRouteImpl{RouteImpl::NoRoute};
     // Routing logic for scaling factors. If not specified, mRouteImpl is used.
     std::optional<RouteImpl> mRouteSfsImpl{std::nullopt};
-    // Whether to use TMA out-of-bounds optimization to reduce wasted traffic. See details in
-    // BatchedGemm/KernelParamsDecl.h.
+    // Whether to use TMA out-of-bounds optimization to reduce wasted traffic. See
+    // details in BatchedGemm/KernelParamsDecl.h.
     bool mPrefetchB{false};
     // Whether to use multicast store for output C.
     bool mUseCMultiCast{false};
@@ -233,8 +235,9 @@ inline bool checkAndUpdateBatchedGemmOptions(
     {
         if (updateOptions)
         {
-            // Since any routing (mRouteAct != NoRoute) requires mUseTwoTmaLoadWarps == true.
-            // Single TMA load warp is not the target use case for OOB optimization.
+            // Since any routing (mRouteAct != NoRoute) requires mUseTwoTmaLoadWarps
+            // == true. Single TMA load warp is not the target use case for OOB
+            // optimization.
             options.mUseTmaOobOpt = false;
         }
         else if (!options.mUseTwoTmaLoadWarps)
@@ -252,7 +255,8 @@ inline bool checkAndUpdateBatchedGemmOptions(
     else
     {
         TLLM_CHECK_ERROR(!gemm::usesFusedBiasReorder(options.mFusedBiasShuffleMode),
-            "FusedBiasShuffleMode::ReorderAndShuffle is only supported for fused-act/"
+            "FusedBiasShuffleMode::ReorderAndShuffle is only "
+            "supported for fused-act/"
             "gated-act paths");
         isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, worldSize, updateOptions);
     }
@@ -308,22 +312,28 @@ inline bool checkAndUpdateBatchedGemmOptions(
     {
         if (batchM)
         {
-            // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek FP8.
+            // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek
+            // FP8.
             TLLM_CHECK_ERROR(options.mN % 128 == 0 && options.mValidN % 128 == 0,
-                "GEMM-N and validN must be a multiple of 128 when using DeepSeek Fp8. Found ", options.mN,
-                " and validN=", options.mValidN);
+                "GEMM-N and validN must be a multiple of 128 when using "
+                "DeepSeek Fp8. Found ",
+                options.mN, " and validN=", options.mValidN);
         }
         else
         {
-            // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek FP8.
+            // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek
+            // FP8.
             TLLM_CHECK_ERROR(options.mM % 128 == 0 && options.mValidM % 128 == 0,
-                "GEMM-M and validM must be a multiple of 128 when using DeepSeek Fp8. Found ", options.mM,
-                " and validM=", options.mValidM);
+                "GEMM-M and validM must be a multiple of 128 when using "
+                "DeepSeek Fp8. Found ",
+                options.mM, " and validM=", options.mValidM);
         }
-        // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek FP8.
+        // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek
+        // FP8.
         TLLM_CHECK_ERROR(options.mK % 128 == 0 && options.mValidK % 128 == 0,
-            "GEMM-K and validK must be a multiple of 128 when using DeepSeek Fp8. Found ", options.mK,
-            " and validK=", options.mValidK);
+            "GEMM-K and validK must be a multiple of 128 when using "
+            "DeepSeek Fp8. Found ",
+            options.mK, " and validK=", options.mValidK);
 
         TLLM_CHECK_ERROR(options.mDtypeC != tg::Dtype::E2m1 && options.mDtypeA == tg::Dtype::E4m3
                 && options.mDtypeB == tg::Dtype::E4m3,
@@ -335,7 +345,8 @@ inline bool checkAndUpdateBatchedGemmOptions(
         TLLM_CHECK_ERROR((options.mRouteSfsImpl.value() == RouteImpl::Ldgsts
                              || options.mRouteSfsImpl.value() == RouteImpl::LdgPlusSts)
                 && options.mRouteImpl == RouteImpl::Tma,
-            "RouteSfsImpl must be equal to RouteImpl, or Ldgsts/LdgPlusSts when RouteImpl is Tma");
+            "RouteSfsImpl must be equal to RouteImpl, or "
+            "Ldgsts/LdgPlusSts when RouteImpl is Tma");
     }
     else if (!options.mRouteSfsImpl.has_value())
     {
@@ -407,7 +418,8 @@ inline bool checkAndUpdateBatchedGemmOptions(
             }
             else
             {
-                // Note: if B is cast from a non-block format to a block format, there are no SFs to load.
+                // Note: if B is cast from a non-block format to a block format, there
+                // are no SFs to load.
                 TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::Linear || !tg::dtypeIsBlockFmt(options.mDtypeB),
                     "Tokens need use SF linear layout when being routed");
             }
@@ -438,7 +450,8 @@ inline bool checkAndUpdateBatchedGemmOptions(
                 || (gemm::isBiasTypeN(options.mBiasType) && options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM)
                 || (gemm::isBiasTypeM(options.mBiasType)
                     && options.mBatchMode == BatchedGemmOptions::BatchMode::BatchN),
-            "BatchedGemm supports per channel bias (M/N) or full matrix bias (Mn).");
+            "BatchedGemm supports per channel bias (M/N) or full matrix bias "
+            "(Mn).");
     }
 
     // We do not handle the case where K is not a multiple of TileK.
@@ -457,8 +470,8 @@ inline bool checkAndUpdateBatchedGemmOptions(
             options.mK % options.mTileK == 0, "K must be a multiple of tileK when using Ldg based SF routing");
     }
 
-    // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and
-    // set mIsUniformNumTokensPerBatch and mBatchStride.
+    // Check if all elements in mBatchedM or mBatchedN are the same (uniform
+    // tokens per batch) and set mIsUniformNumTokensPerBatch and mBatchStride.
     if (options.mIsUniformNumTokensPerBatch)
     {
         int32_t firstValue = 0;
@@ -477,30 +490,39 @@ inline bool checkAndUpdateBatchedGemmOptions(
         }
         else
         {
-            TLLM_CHECK_ERROR(false, "mBatchedM or mBatchedN must be specified when using uniform tokens per batch.");
+            TLLM_CHECK_ERROR(false,
+                "mBatchedM or mBatchedN must be specified when "
+                "using uniform tokens per batch.");
         }
         auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
         TLLM_CHECK_ERROR(isUniformNumTokensPerBatch,
-            "All elements in mBatchedM or mBatchedN must be the same when using uniform "
+            "All elements in mBatchedM or mBatchedN must be the same "
+            "when using uniform "
             "tokens per batch.");
         TLLM_CHECK_ERROR(options.mBatchStrideInTokens >= 0,
-            "Batch stride in tokens must be greater or equal to 0 when using uniform "
+            "Batch stride in tokens must be greater or equal to 0 "
+            "when using uniform "
             "tokens per batch.");
         TLLM_CHECK_ERROR_FMT(options.mBatchStrideInTokens == 0
                 || options.mBatchStrideInTokens == gemm::divUpMul(firstValue, tileTokensDim),
-            "Batch stride in tokens must be a 0 or a multiple of %s {%d} when using "
+            "Batch stride in tokens must be a 0 or a multiple of "
+            "%s {%d} when using "
             "uniform tokens per batch.",
             batchM ? "TileM" : "TileN", tileTokensDim);
-        TLLM_CHECK_ERROR(
-            !options.mUseDeepSeekFp8, "Uniform number of tokens per batch is not supported when using DeepSeek Fp8.");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8,
+            "Uniform number of tokens per batch is not supported when "
+            "using DeepSeek Fp8.");
         TLLM_CHECK_ERROR(!options.mUsePerTokenSfA && !options.mUsePerTokenSfB,
-            "Uniform number of tokens per batch is not supported when using per-token SF.");
+            "Uniform number of tokens per batch is not supported when "
+            "using per-token SF.");
         TLLM_CHECK_ERROR(options.mBiasType == gemm::BiasType::None,
             "Uniform number of tokens per batch is not supported when using bias.");
         TLLM_CHECK_ERROR(options.mRouteImpl == RouteImpl::NoRoute,
-            "Uniform number of tokens per batch is not supported when using routing.");
+            "Uniform number of tokens per batch is not supported when "
+            "using routing.");
         TLLM_CHECK_ERROR(!options.mFusedAct,
-            "Uniform number of tokens per batch is not supported when using fused gated activation.");
+            "Uniform number of tokens per batch is not supported when "
+            "using fused gated activation.");
         TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeA) && !tg::dtypeIsBlockFmt(options.mDtypeB)
                 && !tg::dtypeIsBlockFmt(options.mDtypeC),
             "Uniform number of tokens per batch is not supported when using block "

@@ -69,7 +69,8 @@ public:
                 // E.g. possible in case of
                 // mNumBytesAndAlignmentPerSmemChunk = {{1, 1}, {1, 1}, {1024, 1}}
                 // mFirstChunkReuse = {false, false, true}
-                // The last chunk is larger than the first plus second, so total size is 1024.
+                // The last chunk is larger than the first plus second, so total size is
+                // 1024.
                 totalSize = paddedSize;
             }
             else if (!mFirstChunkReuse[ii])
@@ -169,7 +170,8 @@ private:
     // NOTE: be careful and make sure that the memory dependency is clear and
     // chunks in the beginning of the SMEM can be overwritten.
     std::vector<std::pair<int32_t, int32_t>> mNumBytesAndAlignmentPerSmemChunk;
-    // Chunk reuse configuration. True at ith position means that ith chunk starts at smemOffset = 0.
+    // Chunk reuse configuration. True at ith position means that ith chunk starts
+    // at smemOffset = 0.
     std::vector<bool> mFirstChunkReuse;
     // Buffer names for inspection purposes.
     std::vector<std::string> mSmemChunkNames;
@@ -234,7 +236,8 @@ public:
             // [per-token SF ] (16B aligned) (if needed)
             // [bias         ] (16B aligned) (if needed)
             //
-            // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
+            // SMEM for smemA and smemB might be repurposed and used for gmemC0 and
+            // gmemC1:
             //
             // [..smemA..][..smemB..][..smemBShuffle..]
             //
@@ -286,8 +289,8 @@ public:
 
             // SmemBShuffle
             // FIXME: we should be able either:
-            // - Do modification in-place. For that we need to resolve pipeline dependency between
-            // smemB -> shuffleSmemB -> mma
+            // - Do modification in-place. For that we need to resolve pipeline
+            // dependency between smemB -> shuffleSmemB -> mma
             // - Do 4 TMA SW32 loads or several LDGSTS loads.
             {
                 // Number of bytes in save shuffled B in shared memory.
@@ -305,7 +308,8 @@ public:
             }
 
             // GmemC
-            // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to store gated output.
+            // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to
+            // store gated output.
             for (int resIdx = 0; resIdx < 2; ++resIdx)
             {
                 // Type of the data in the SMEM for GmemC
@@ -337,8 +341,9 @@ public:
                 // Number of bytes for store C alignment for TMA store.
                 auto const numBytesAlignmentStoreC = 1024;
                 // gmemC reuses loadAb memory for split-K in DSMEM.
-                // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
-                // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+                // Epilogue1 does not reuse and continues after the memory allocated
+                // Epilogue0 NOTE: we can always reuse loadAb SMEM as long as we don't
+                // have persistent scheduler.
 
                 auto const reuseFirstChunksSmemStoreC
                     = doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
@@ -412,13 +417,16 @@ public:
 
             // Bias
             //
-            // For DeepSeek FP8 we have two epilogue resources (Epilogue0 and Epilogue1) that share the
-            // same SMEM stack base pointer. Each handles a different half-tile of the output along the
-            // (halved) hidden axis. If they both wrote into the same bias SMEM chunk, the later loader
-            // would clobber the earlier loader's data. So allocate one bias chunk per resource here
-            // (smemBias0 / smemBias1) and let `getSmemOffsetBias(traits, resIdx)` return the per-
-            // resource offset. For DeepSeek FP8 + BiasType::Mn, each per-resource bias chunk only
-            // holds the half-tile (tileM*tileN/2 floats), matching what each Epilogue actually loads.
+            // For DeepSeek FP8 we have two epilogue resources (Epilogue0 and
+            // Epilogue1) that share the same SMEM stack base pointer. Each handles a
+            // different half-tile of the output along the (halved) hidden axis. If
+            // they both wrote into the same bias SMEM chunk, the later loader would
+            // clobber the earlier loader's data. So allocate one bias chunk per
+            // resource here (smemBias0 / smemBias1) and let
+            // `getSmemOffsetBias(traits, resIdx)` return the per- resource offset.
+            // For DeepSeek FP8 + BiasType::Mn, each per-resource bias chunk only
+            // holds the half-tile (tileM*tileN/2 floats), matching what each Epilogue
+            // actually loads.
             {
                 int32_t numBytesSmemBiasPerRes = 0;
                 if (isBiasTypeN(biasType))
@@ -436,11 +444,12 @@ public:
                 }
                 // Number of bytes alignment for bias
                 auto const numBytesAlignmentBias = 16;
-                // Only split into per-resource (Epilogue0/Epilogue1) chunks for the DeepSeek FP8 +
-                // BiasType::Mn path, where each epilogue resource loads its own half-tile of bias
-                // and they would otherwise clobber each other. For every other configuration —
-                // including plain DeepSeek FP8 with BiasType::None — keep the original single-chunk
-                // layout so we don't perturb SMEM offsets of unrelated tests.
+                // Only split into per-resource (Epilogue0/Epilogue1) chunks for the
+                // DeepSeek FP8 + BiasType::Mn path, where each epilogue resource loads
+                // its own half-tile of bias and they would otherwise clobber each
+                // other. For every other configuration — including plain DeepSeek FP8
+                // with BiasType::None — keep the original single-chunk layout so we
+                // don't perturb SMEM offsets of unrelated tests.
                 int32_t const numBiasResources = (useDeepSeekFp8 && isBiasTypeMn(biasType)) ? 2 : 1;
                 for (int32_t biasResIdx = 0; biasResIdx < numBiasResources; ++biasResIdx)
                 {
@@ -589,7 +598,8 @@ public:
 
             // Sparsity info for A
             {
-                // Number of columns for the sparsity info for A (note: for Dense, this is 0).
+                // Number of columns for the sparsity info for A (note: for Dense, this
+                // is 0).
                 auto const numTmemColsSparsityInfoA
                     = numStagesA * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
                 // Number of columns for Sf alignment.
@@ -623,7 +633,8 @@ public:
     bool mUsePersistentScheduler{};
     // Whether use customized MMA for 3xNvFp4
     bool mUseCustomizedMma3xNvFp4{};
-    // Which BiasType::Mn preprocessing steps are fused into the kernel instead of the host.
+    // Which BiasType::Mn preprocessing steps are fused into the kernel instead of
+    // the host.
     FusedBiasShuffleMode mFusedBiasShuffleMode{FusedBiasShuffleMode::None};
     // The number of epilogue warps.
     int32_t mNumEpilogueWarps{};
@@ -715,11 +726,13 @@ inline int32_t getSmemOffsetPerTokenSfB(KernelTraits traits)
 
 inline int32_t getSmemOffsetBias(KernelTraits traits, int resIdx = 0)
 {
-    // The allocator decides — based on `useDeepSeekFp8 && isBiasTypeMn(biasType)` — whether to
-    // create per-resource chunks (smemBias0, smemBias1) or a single shared chunk (smemBias0).
-    // Rather than have every caller re-derive that predicate, fall back to smemBias0 when the
-    // requested per-resource chunk does not exist. This keeps the rule in one place — where the
-    // chunks are added — and lets consumers stay ignorant of the kernel's SMEM layout strategy.
+    // The allocator decides — based on `useDeepSeekFp8 && isBiasTypeMn(biasType)`
+    // — whether to create per-resource chunks (smemBias0, smemBias1) or a single
+    // shared chunk (smemBias0). Rather than have every caller re-derive that
+    // predicate, fall back to smemBias0 when the requested per-resource chunk
+    // does not exist. This keeps the rule in one place — where the chunks are
+    // added — and lets consumers stay ignorant of the kernel's SMEM layout
+    // strategy.
     std::string const name = "smemBias" + std::to_string(resIdx);
     return traits.mSmemAllocatorHelper.getChunkOffsetByName(
         traits.mSmemAllocatorHelper.hasChunkByName(name) ? name : "smemBias0");

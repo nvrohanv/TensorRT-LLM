@@ -37,7 +37,8 @@ inline CUresult launchKernelFlexibleCgaSizes(void* kernelParams, void* cudaStrea
     dim3 block3, dim3 grid3, dim3 cluster3, dim3 fallbackCluster3, bool enablesPdl)
 {
     // Make sure we can launch with that much shared memory.
-    // Note: those function-level settings are actually ignored as we use per-launch attributes.
+    // Note: those function-level settings are actually ignored as we use
+    // per-launch attributes.
     if (smemSize > 48 * 1024)
     {
         CUresult result;
@@ -101,7 +102,8 @@ inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemS
 )
 {
     // Make sure we can launch with that much shared memory.
-    // Note: those function-level settings are actually ignored as we use per-launch attributes.
+    // Note: those function-level settings are actually ignored as we use
+    // per-launch attributes.
     if (smemSize > 48 * 1024)
     {
         CUresult result;
