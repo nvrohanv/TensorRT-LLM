@@ -21,9 +21,8 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Be careful when modifying this file as it is included by the generated
-// kernels. For example, do not add TLLM_CHECK_* constructs in this file.
-// Thanks!
+// Be careful when modifying this file as it is included by the generated kernels. For example, do
+// not add TLLM_CHECK_* constructs in this file. Thanks!
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -37,26 +36,22 @@ namespace gen
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// This enumeration defines structured sparsity modes. Please refer to the PTX
-// ISA for more details.
+// This enumeration defines structured sparsity modes. Please refer to the PTX ISA for more details.
 enum class Sparsity
 {
     // No sparsity.
     Dense,
 
-    // For each chunk of 2 elements, 1 is non-zero. Only non-zero elements are
-    // stored.
+    // For each chunk of 2 elements, 1 is non-zero. Only non-zero elements are stored.
     // A 4-bit index is used to indicate the position of the non-zero element.
-    // The index may only take the value 0b1110 or 0b0100, other values are
-    // undefined behavior.
+    // The index may only take the value 0b1110 or 0b0100, other values are undefined behavior.
     //
     // 0b1110:                               0b0100:
     // |------ a ------|------ 0 ------|     |------ 0 ------|------ a ------|
     // |  11   |  10   |  01   |  00   |     |  11   |  10   |  01   |  00   |
     Any_1_2,
 
-    // For each chunk of 4 elements, 2 are non-zero. Only non-zero elements are
-    // stored.
+    // For each chunk of 4 elements, 2 are non-zero. Only non-zero elements are stored.
     // A 4-bit index is used to indicate the position of the non-zero elements.
     // Meaningful values are: 0b0100, 0b1000, 0b1100, 0b1001, 0b1101, 0b1110.
     // Most other values are undefined behavior.
@@ -66,8 +61,7 @@ enum class Sparsity
     // |  11   |  10   |  01   |  00   |
     Any_2_4,
 
-    // For each chunk of 8 elements, 4 are non-zero. Only non-zero elements are
-    // stored.
+    // For each chunk of 8 elements, 4 are non-zero. Only non-zero elements are stored.
     // Further, the zero and non-zero elements are grouped in pairs.
     // A 4-bit index is used to indicate the position of the non-zero elements.
     // Meaningful values are: 0b0100, 0b1000, 0b1100, 0b1001, 0b1101, 0b1110.

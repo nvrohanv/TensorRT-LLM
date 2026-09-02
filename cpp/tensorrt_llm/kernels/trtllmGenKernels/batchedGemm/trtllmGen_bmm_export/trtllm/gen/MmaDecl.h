@@ -47,8 +47,7 @@ enum class MmaKind : uint32_t
     // or dtypeA = dtypeB = Bfloat16 and dtypeD = [Fp32]
     // Corresponds to the kind::f16 of tcgen05.mma.
     Fp16 = 1,
-    // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16,
-    // Fp32]
+    // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16, Fp32]
     // Corresponds to the kind::f8f6f4 of tcgen05.mma.
     Fp8Fp6Fp4 = 2,
     // Supports dtypeA = dtypeB = [Int8, Uint8] and dtypeD = [Int32]

@@ -79,19 +79,15 @@ enum class ActType
     // clang-format on
     SwiGlu,
     // For ActType == GeGlu, we use the simplified version
-    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 *
-    //    scaleGate)),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate
-    // are input scales,
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
     GeGlu,
-    // For ActType == SiTuGlu, the formula is (gate on x1, matching SwiGlu
-    // convention):
+    // For ActType == SiTuGlu, the formula is (gate on x1, matching SwiGlu convention):
     //    left  = beta  * tanh(x0 / beta)
     //    right = alpha * tanh(x1 / alpha) * sigmoid(x1)
     //    gatedAct = left * right
-    // where alpha and beta are the gatedActAlpha and gatedActBeta parameters
-    // respectively.
+    // where alpha and beta are the gatedActAlpha and gatedActBeta parameters respectively.
     // Both alpha and beta must be > 0. Default values are 1.0 for both.
     SiTuGlu,
     // Placeholder for no activation; not implemented in codegen
@@ -129,12 +125,11 @@ inline std::string getActTypeName(ActType type)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Returns true for activations where x0 appears only in linear terms (e.g.,
-// x0+beta in SwiGlu). Returns false for activations where x0 feeds into
-// nonlinearities (e.g., tanh(x0/beta) in SiTuGlu).
+// Returns true for activations where x0 appears only in linear terms (e.g., x0+beta in SwiGlu).
+// Returns false for activations where x0 feeds into nonlinearities (e.g., tanh(x0/beta) in
+// SiTuGlu).
 //
-// Drives: scaleC placement in applyGatedAcc, test harness scaleC/beta
-// computation.
+// Drives: scaleC placement in applyGatedAcc, test harness scaleC/beta computation.
 inline bool isLinearInX0(ActType type)
 {
     return isGeGlu(type) || isSwiGlu(type);
@@ -187,9 +182,7 @@ inline bool checkAndUpdateGemmGatedActOptions(
 
     if (options.mUseTmaStore)
     {
-        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) /
-                    /* bits */ 8 % 32
-                == 0,
+        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) / /* bits */ 8 % 32 == 0,
             "Unsupported output hidden tile size");
     }
 
