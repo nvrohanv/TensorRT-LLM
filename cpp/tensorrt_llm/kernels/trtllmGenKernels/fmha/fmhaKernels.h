@@ -266,7 +266,7 @@ public:
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
         algoFilterForCubinPath(options);
-        auto [hashId, info] = hashFromFmhaOptions(options);
+        auto [hashId, info] = lookupHashFromFmhaOptions(options);
 
         if (mFunctions.find(hashId) == mFunctions.end())
         {
@@ -363,7 +363,7 @@ public:
         else
         {
             algoFilterForCubinPath(options);
-            auto [hashId, info] = hashFromFmhaOptions(options);
+            auto [hashId, info] = lookupHashFromFmhaOptions(options);
 
             // load from cubin
             auto const findIter = mFunctions.find(hashId);
@@ -373,9 +373,9 @@ public:
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
             const CUfunction func = findIter->second.mDeviceFunction;
 
-            // mGroupsHeadsQ and mGroupsTokensHeadsQ are not part of the hashID, so they don't
-            // affect kernel lookup. Use cubin-side values from kernelMeta instead of AutoTuner
-            // output, since cubins are exported with enableAutotuner=false.
+            // mGroupsTokensHeadsQ is part of the hashID, so this matches the autotuner's choice
+            // unless lookupHashFromFmhaOptions fell back to the only exported variant; mGroupsHeadsQ
+            // is not hashed. Use cubin-side values so the launch params match the cubin.
             options.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
             options.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
 
@@ -407,7 +407,7 @@ private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool hasLeftSlidingBound,
-        bool hasRightSlidingBound) const
+        bool hasRightSlidingBound, bool groupsTokensHeadsQ) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -439,6 +439,8 @@ private:
         // Bit 57 - 57: skipsSoftmax.
         // Bit 58 - 58: hasLeftSlidingBound.
         // Bit 59 - 59: hasRightSlidingBound.
+        // Bit 60 - 60: groupsTokensHeadsQ. Grouped and non-grouped SwapsMmaAb generation kernels
+        //              otherwise share every other field (e.g. the NVFP4 KV Q8/Q16 variants).
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -448,7 +450,7 @@ private:
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
             | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(hasLeftSlidingBound) << 58)
-            | (static_cast<uint64_t>(hasRightSlidingBound) << 59);
+            | (static_cast<uint64_t>(hasRightSlidingBound) << 59) | (static_cast<uint64_t>(groupsTokensHeadsQ) << 60);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -457,7 +459,7 @@ private:
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
-            kernelMeta.mHasLeftSlidingBound, kernelMeta.mHasRightSlidingBound);
+            kernelMeta.mHasLeftSlidingBound, kernelMeta.mHasRightSlidingBound, kernelMeta.mGroupsTokensHeadsQ);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -487,7 +489,8 @@ private:
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible)
             + ", hasLeftSlidingBound=" + std::to_string(options.mHasLeftSlidingBound)
-            + ", hasRightSlidingBound=" + std::to_string(options.mHasRightSlidingBound);
+            + ", hasRightSlidingBound=" + std::to_string(options.mHasRightSlidingBound)
+            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
         return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
@@ -497,8 +500,30 @@ private:
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
                                   static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
-                                  options.mHasLeftSlidingBound, options.mHasRightSlidingBound),
+                                  options.mHasLeftSlidingBound, options.mHasRightSlidingBound,
+                                  options.mGroupsTokensHeadsQ),
             info);
+    }
+
+    // Hash used to look up the cubin for the autotuner-selected options. Prefer the exact
+    // groupsTokensHeadsQ variant; if only the other variant was exported, use it instead (the
+    // pre-existing behavior, when groupsTokensHeadsQ was not part of the hash and the cubin-side
+    // value was used). Returns the exact hash when neither variant exists.
+    std::pair<uint64_t, std::string> lookupHashFromFmhaOptions(FmhaOptions const& options) const
+    {
+        auto [hashId, info] = hashFromFmhaOptions(options);
+        if (mFunctions.find(hashId) == mFunctions.end())
+        {
+            FmhaOptions altOptions = options;
+            altOptions.mGroupsTokensHeadsQ = !options.mGroupsTokensHeadsQ;
+            uint64_t const altHashId = hashFromFmhaOptions(altOptions).first;
+            if (mFunctions.find(altHashId) != mFunctions.end())
+            {
+                TLLM_LOG_DEBUG("No exact groupsTokensHeadsQ match; using the other variant: " + info);
+                hashId = altHashId;
+            }
+        }
+        return std::make_pair(hashId, info);
     }
 
     std::string const& getExecPath() const
@@ -993,6 +1018,9 @@ private:
         TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
     }
 
+    // NOTE: Not used for kernel lookup (run() and checkIfKernelExist() use lookupHashFromFmhaOptions).
+    // SelectKernelParams has no groupsTokensHeadsQ field, so this always hashes the non-grouped
+    // variant and will not match grouped-token cubins.
     std::pair<uint64_t, std::string> hashFromRunnerParams(
         RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
     {
@@ -1037,7 +1065,8 @@ private:
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
-                selectKernelParams.mSkipsSoftmaxWhenPossible, hasLeftSlidingBound, hasRightSlidingBound),
+                selectKernelParams.mSkipsSoftmaxWhenPossible, hasLeftSlidingBound, hasRightSlidingBound,
+                /*groupsTokensHeadsQ=*/false),
             info);
     }
 
